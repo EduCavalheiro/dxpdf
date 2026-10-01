@@ -1318,30 +1318,12 @@ pub(super) fn build_shape_text_commands(
         wsp.body_pr.as_ref().and_then(|bp| bp.auto_fit),
     );
 
-    // Sub-state with the host's page dimensions and field context. Counters
-    // are reset so a footnote/list inside a shape body doesn't bump the
-    // outer counters.
-    let mut sub_state = BuildState {
-        // §17.3.1.19: a heading inside a text box is not a position in the
-        // document's main story — see `OutlineCollector`.
-        outline: crate::render::layout::build::OutlineCollector::Excluded,
-        shape_auto_fit: auto_fit,
-        page_config: state.page_config.clone(),
-        footnotes: Default::default(),
-        endnote_counter: 0,
-        list_counters: std::collections::HashMap::new(),
-        field_ctx: state.field_ctx,
+    let mut sub_state = isolated_sub_state(
+        state,
+        auto_fit,
         shape_default_text_color,
         shape_default_font_family,
-        // Its own set: this sub-state is built from a `&BuildState`, so the
-        // parent's set can't be borrowed mutably here. A border style used
-        // only inside a shape text box is therefore reported once per shape
-        // rather than once per render — bounded over-reporting in a rare case,
-        // preferred over making `state` mutable through ten signatures.
-        warned_border_styles: std::collections::HashSet::new(),
-        warned_row_cell_spacing: false,
-        warned_orphan_vmerge: false,
-    };
+    );
 
     let hf = super::build_header_footer_content(&wsp.txbx_content, ctx, &mut sub_state);
     // §20.1.2.1.18: the body's own shrink also applies to the fallback line
@@ -1387,6 +1369,146 @@ pub(super) fn build_shape_text_commands(
         commands.push(cmd);
     }
     commands
+}
+
+/// A `BuildState` for laying out content that is not part of the main story
+/// (a shape's text body, a positioned frame): the host's page dimensions and
+/// field context, fresh list/footnote counters so the interior does not bump
+/// the outer ones, and the outline switched off (§17.3.1.19 — a heading
+/// inside a text box is not a position in the document's main story).
+fn isolated_sub_state(
+    state: &BuildState,
+    shape_auto_fit: crate::render::layout::ShapeAutoFit,
+    shape_default_text_color: Option<crate::render::resolve::color::RgbColor>,
+    shape_default_font_family: Option<String>,
+) -> BuildState {
+    BuildState {
+        outline: crate::render::layout::build::OutlineCollector::Excluded,
+        shape_auto_fit,
+        page_config: state.page_config.clone(),
+        footnotes: Default::default(),
+        endnote_counter: 0,
+        list_counters: std::collections::HashMap::new(),
+        field_ctx: state.field_ctx,
+        shape_default_text_color,
+        shape_default_font_family,
+        // Its own set: this sub-state is built from a `&BuildState`, so the
+        // parent's set can't be borrowed mutably here. A border style used
+        // only inside a shape text box is therefore reported once per shape
+        // rather than once per render — bounded over-reporting in a rare case,
+        // preferred over making `state` mutable through ten signatures.
+        warned_border_styles: std::collections::HashSet::new(),
+        warned_row_cell_spacing: false,
+        warned_orphan_vmerge: false,
+    }
+}
+
+/// §17.3.1.11 `w:framePr` without a drop cap: a text frame whose vertical
+/// position is fixed to the page or its margins, built as a fill-less
+/// [`FloatingShape`] carrying the paragraph as its text body.
+///
+/// The paragraph leaves the flow entirely — Word lays the frame out at its
+/// own coordinates and the surrounding text does not see it (`wrap="none"`,
+/// the value covers and form-like layouts use). Wrapping text *around* a frame
+/// (`around`/`tight`) is not modelled; those frames still take no space, which
+/// is closer to Word than stacking them inline at the top of the page, the
+/// previous behaviour.
+///
+/// `None` — and the paragraph stays in the flow, as before — when the frame
+/// has no page/margin vertical anchor. A `text`-anchored frame (and the
+/// attribute's absence, which frames tied to the next paragraph use) is
+/// positioned relative to a paragraph the builder has not placed yet.
+pub(super) fn build_page_frame(
+    p: &Paragraph,
+    ctx: &BuildContext,
+    state: &BuildState,
+) -> Option<FloatingShape> {
+    use crate::model::{FrameKind, HeightRule, TableAnchor, TableXAlign, TableYAlign};
+    use crate::render::layout::draw_command::ResolvedFill;
+    use crate::render::layout::section::WrapMode;
+
+    let Some(FrameKind::TextBox(frame)) = p.properties.frame_properties.get().copied() else {
+        return None;
+    };
+    let v_anchor = frame.v_anchor?;
+    if v_anchor == TableAnchor::Text {
+        return None;
+    }
+
+    let pc = &state.page_config;
+    let content_width = pc.page_size.width - pc.margins.left - pc.margins.right;
+    let content_height = pc.page_size.height - pc.margins.top - pc.margins.bottom;
+    let width = frame.width.map(Pt::from).unwrap_or(content_width);
+    if width <= Pt::ZERO {
+        return None;
+    }
+
+    // The paragraph itself, minus the frame, laid out as the frame's body.
+    let mut body = p.clone();
+    body.properties.frame_properties = model::Dup::from(None);
+    let mut sub_state =
+        isolated_sub_state(state, crate::render::layout::ShapeAutoFit::NONE, None, None);
+    let hf = super::build_header_footer_content(
+        &[model::Block::Paragraph(Box::new(body))],
+        ctx,
+        &mut sub_state,
+    );
+    let result = crate::render::layout::section::stack_blocks(
+        &hf.blocks,
+        width,
+        super::default_line_height(ctx),
+        None,
+        PageParity::Odd,
+    );
+
+    // §17.3.1.11 `h`/`hRule`: `exact` fixes the frame height, `atLeast` (and a
+    // missing rule, which §17.18.37 reads as `auto`) grows it to the text.
+    let height = match (frame.height.map(Pt::from), frame.height_rule) {
+        (Some(h), Some(HeightRule::Exact)) => h,
+        (Some(h), _) => h.max(result.height),
+        (None, _) => result.height,
+    };
+
+    // §17.3.1.11 `hAnchor` (default `column`, read as the margin box: frames
+    // are laid out per section, not per column) and `x`/`xAlign`.
+    let (x_origin, x_span) = match frame.h_anchor {
+        Some(TableAnchor::Page) => (Pt::ZERO, pc.page_size.width),
+        _ => (pc.margins.left, content_width),
+    };
+    let x = match (frame.x, frame.x_align) {
+        (Some(x), _) => x_origin + Pt::from(x),
+        (None, Some(TableXAlign::Center)) => x_origin + (x_span - width) * 0.5,
+        (None, Some(TableXAlign::Right | TableXAlign::Outside)) => x_origin + x_span - width,
+        (None, _) => x_origin,
+    };
+    let (y_origin, y_span) = match v_anchor {
+        TableAnchor::Page => (Pt::ZERO, pc.page_size.height),
+        _ => (pc.margins.top, content_height),
+    };
+    let y = match (frame.y, frame.y_align) {
+        (Some(y), _) => y_origin + Pt::from(y),
+        (None, Some(TableYAlign::Center)) => y_origin + (y_span - height) * 0.5,
+        (None, Some(TableYAlign::Bottom | TableYAlign::Outside)) => y_origin + y_span - height,
+        (None, _) => y_origin,
+    };
+
+    Some(FloatingShape {
+        x: FloatingImageX::Absolute(x),
+        y: FloatingImageY::Absolute(y),
+        size: PtSize::new(width, height),
+        rotation: crate::model::dimension::Dimension::new(0),
+        flip_h: false,
+        flip_v: false,
+        wrap_mode: WrapMode::None,
+        dist_left: Pt::ZERO,
+        dist_right: Pt::ZERO,
+        behind_doc: false,
+        paths: Vec::new(),
+        fill: ResolvedFill::None,
+        stroke: None,
+        effects: Vec::new(),
+        text_commands: result.commands,
+    })
 }
 
 /// Whether `@vertOverflow` keeps `cmd`, given the bottom of the body's box.
@@ -2102,6 +2224,91 @@ mod tests {
             line_height > 0.0 && line_height < BOX_HEIGHT,
             "one line fits inside the 112pt box, implied height {line_height}"
         );
+    }
+
+    // ── §17.3.1.11 page-anchored text frames ─────────────────────────────
+
+    fn framed_paragraph(frame: crate::model::TextBoxPositioning) -> ModelParagraph {
+        let ModelParagraph { content, .. } = match &wsp_with_text(None).txbx_content[0] {
+            crate::model::Block::Paragraph(p) => (**p).clone(),
+            _ => unreachable!(),
+        };
+        let mut properties = ParagraphProperties::default();
+        properties.frame_properties =
+            crate::model::Dup::from(Some(crate::model::FrameKind::TextBox(frame)));
+        ModelParagraph {
+            style_id: None,
+            properties,
+            mark_run_properties: None,
+            content,
+            rsids: crate::model::ParagraphRevisionIds::default(),
+        }
+    }
+
+    fn page_frame(
+        frame: crate::model::TextBoxPositioning,
+    ) -> Option<crate::render::layout::section::FloatingShape> {
+        let resolved = empty_resolved();
+        let registry = FontRegistry::new(skia_safe::FontMgr::new());
+        let measurer = TextMeasurer::new(&registry);
+        let ctx = BuildContext {
+            measurer: &measurer,
+            resolved: &resolved,
+        };
+        super::build_page_frame(
+            &framed_paragraph(frame),
+            &ctx,
+            &crate::render::layout::build::BuildState::default(),
+        )
+    }
+
+    /// The defect: `w:framePr` with `vAnchor="page"` was laid out inline at the
+    /// top of the flow, so a cover's "CLIENTE: …" block (x=304, y=15188 twips)
+    /// landed at the top of the page and white text on the cover art vanished.
+    #[test]
+    fn a_page_anchored_frame_sits_at_its_page_coordinates_with_its_text() {
+        use crate::model::{TableAnchor, TextBoxPositioning};
+        let shape = page_frame(TextBoxPositioning {
+            width: Some(Dimension::new(9000)),
+            height: Some(Dimension::new(420)),
+            h_anchor: Some(TableAnchor::Page),
+            v_anchor: Some(TableAnchor::Page),
+            x: Some(Dimension::new(304)),
+            y: Some(Dimension::new(15188)),
+            ..Default::default()
+        })
+        .expect("a page-anchored frame leaves the flow as a shape");
+        use crate::render::dimension::Pt;
+        use crate::render::layout::section::{FloatingImageY, PageParity};
+        assert_eq!(
+            shape.x.resolve(PageParity::Odd),
+            Pt::new(15.2),
+            "x = 304 twips from the page edge"
+        );
+        assert_eq!(
+            shape.y,
+            FloatingImageY::Absolute(Pt::new(759.4)),
+            "y = 15188 twips from the page top"
+        );
+        assert_eq!(shape.size.width, Pt::new(450.0));
+        assert!(
+            !shape.text_commands.is_empty(),
+            "the frame carries its paragraph as text"
+        );
+    }
+
+    /// A frame anchored to the text (or with no vertical anchor) is positioned
+    /// relative to a paragraph the builder has not placed; it stays in the flow.
+    #[test]
+    fn a_text_anchored_frame_stays_in_the_flow() {
+        use crate::model::{TableAnchor, TextBoxPositioning};
+        let text = TextBoxPositioning {
+            v_anchor: Some(TableAnchor::Text),
+            y: Some(Dimension::new(100)),
+            ..Default::default()
+        };
+        assert!(page_frame(text).is_none());
+        assert!(page_frame(TextBoxPositioning::default()).is_none());
     }
 
     /// The top inset shifts the body one-for-one — which is what says the box

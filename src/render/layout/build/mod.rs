@@ -117,19 +117,56 @@ pub fn build_section_blocks(
     state: &mut BuildState,
 ) -> BuiltSection {
     let mut pending_dropcap: Option<crate::render::layout::paragraph::DropCapInfo> = None;
-    let blocks: Vec<LayoutBlock> = section
-        .blocks
-        .iter()
-        .filter_map(|block| {
-            build_block(
-                block,
-                config.content_width(),
-                ctx,
-                state,
-                &mut pending_dropcap,
-            )
-        })
-        .collect();
+    let mut blocks: Vec<LayoutBlock> = Vec::with_capacity(section.blocks.len());
+    // §17.3.1.11: page-anchored frames leave the flow and ride as absolutely
+    // positioned shapes on a neighbouring paragraph — the preceding one when the
+    // frame directly follows a paragraph, else the next paragraph built. Their
+    // position is page-absolute, so the carrier only decides the *page*, and a
+    // neighbour lands on the same page as the frame's own anchor.
+    let mut pending_frames: Vec<crate::render::layout::section::FloatingShape> = Vec::new();
+    for block in &section.blocks {
+        if let model::Block::Paragraph(p) = block {
+            if let Some(frame) = floating::build_page_frame(p, ctx, state) {
+                match blocks.last_mut() {
+                    Some(LayoutBlock::Paragraph {
+                        floating_shapes, ..
+                    }) => floating_shapes.push(frame),
+                    _ => pending_frames.push(frame),
+                }
+                continue;
+            }
+        }
+        let Some(mut built) = build_block(
+            block,
+            config.content_width(),
+            ctx,
+            state,
+            &mut pending_dropcap,
+        ) else {
+            continue;
+        };
+        if let LayoutBlock::Paragraph {
+            floating_shapes, ..
+        } = &mut built
+        {
+            floating_shapes.append(&mut pending_frames);
+        }
+        blocks.push(built);
+    }
+    if !pending_frames.is_empty() {
+        match blocks.iter_mut().rev().find_map(|b| match b {
+            LayoutBlock::Paragraph {
+                floating_shapes, ..
+            } => Some(floating_shapes),
+            LayoutBlock::Table { .. } => None,
+        }) {
+            Some(carrier) => carrier.append(&mut pending_frames),
+            None => log::warn!(
+                "{} page-anchored frame(s) in a section without paragraphs; not rendered",
+                pending_frames.len()
+            ),
+        }
+    }
 
     BuiltSection { blocks }
 }
