@@ -544,6 +544,23 @@ fn run_is_hidden(tr: &TextRun, ctx: &FragmentCtx<'_>) -> bool {
         .unwrap_or(false)
 }
 
+/// §17.3.2.5 `w:caps`: whether this run displays in capitals. The same
+/// §17.7.2 cascade and the same value-not-presence reading as
+/// [`run_is_hidden`]: `<w:caps w:val="0"/>` turns an inherited `caps` off.
+fn run_is_all_caps(tr: &TextRun, ctx: &FragmentCtx<'_>) -> bool {
+    if let Some(caps) = tr.properties.all_caps {
+        return caps;
+    }
+    if let (Some(style_id), Some(styles)) = (&tr.style_id, ctx.resolved_styles) {
+        if let Some(caps) = styles.get(style_id).and_then(|s| s.run.all_caps) {
+            return caps;
+        }
+    }
+    ctx.paragraph_run_defaults
+        .and_then(|defaults| defaults.all_caps)
+        .unwrap_or(false)
+}
+
 /// Walk inline content and collect fragments.
 /// `measure_text` is a callback that measures text width/height/ascent for a given font.
 /// `resolved_styles` is used to look up character styles (w:rStyle) on text runs.
@@ -582,11 +599,33 @@ where
     // borrow through `build_inline_units` and the field pre-pass — not worth it
     // for a path taken this rarely.
     let hidden = |inline: &Inline| matches!(inline, Inline::TextRun(tr) if run_is_hidden(tr, ctx));
-    let visible: Option<Vec<Inline>> = inlines
-        .iter()
-        .any(hidden)
-        .then(|| inlines.iter().filter(|i| !hidden(i)).cloned().collect());
-    let inlines: &[Inline] = visible.as_deref().unwrap_or(inlines);
+    // §17.3.2.5 `w:caps`: the run displays in capitals while its stored text
+    // keeps its case. Applied here, on the same copy-only-when-needed basis as
+    // `w:vanish`, so measurement, line fitting and painting all see the
+    // capitals. `to_uppercase` is the full Unicode mapping (ß → SS), which is
+    // what Word shows.
+    let capitals =
+        |inline: &Inline| matches!(inline, Inline::TextRun(tr) if run_is_all_caps(tr, ctx));
+    let rewritten: Option<Vec<Inline>> =
+        inlines.iter().any(|i| hidden(i) || capitals(i)).then(|| {
+            inlines
+                .iter()
+                .filter(|i| !hidden(i))
+                .map(|i| match i {
+                    Inline::TextRun(tr) if run_is_all_caps(tr, ctx) => {
+                        let mut tr = tr.clone();
+                        for element in &mut tr.content {
+                            if let RunElement::Text(text) = element {
+                                *text = text.to_uppercase();
+                            }
+                        }
+                        Inline::TextRun(tr)
+                    }
+                    other => other.clone(),
+                })
+                .collect()
+        });
+    let inlines: &[Inline] = rewritten.as_deref().unwrap_or(inlines);
 
     let mut fragments = Vec::new();
     let mut field_depth: i32 = 0; // tracks nested complex field state
@@ -1417,6 +1456,49 @@ mod tests {
             collect(&inlines, &default_ctx(12.0)).is_empty(),
             "a hidden run must not reach layout at all"
         );
+    }
+
+    /// §17.3.2.5 `w:caps`: the run is drawn in capitals, and `w:val="0"` on the
+    /// run turns inherited caps back off. Before, `all_caps` was parsed and
+    /// never read, so "Document generated" rendered in the stored case.
+    #[test]
+    fn caps_draws_the_run_in_capitals_and_the_run_can_opt_out() {
+        let run = |text: &str, caps: Option<bool>| {
+            Inline::TextRun(Box::new(TextRun {
+                style_id: None,
+                properties: RunProperties {
+                    all_caps: caps,
+                    ..Default::default()
+                },
+                content: vec![RunElement::Text(text.into())],
+                rsids: RevisionIds::default(),
+            }))
+        };
+        let text_of = |frags: &[Fragment]| -> String {
+            frags
+                .iter()
+                .filter_map(|f| match f {
+                    Fragment::Text { text, .. } => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let ctx = default_ctx(12.0);
+        assert_eq!(
+            text_of(&collect(&[run("Straße ok", Some(true))], &ctx)),
+            "STRASSE OK"
+        );
+
+        let defaults = RunProperties {
+            all_caps: Some(true),
+            ..Default::default()
+        };
+        let ctx = FragmentCtx {
+            paragraph_run_defaults: Some(&defaults),
+            ..default_ctx(12.0)
+        };
+        assert_eq!(text_of(&collect(&[run("keep", Some(false))], &ctx)), "keep");
+        assert_eq!(text_of(&collect(&[run("up", None)], &ctx)), "UP");
     }
 
     /// Removal, not a zero-width draw: the visible text either side has to end
