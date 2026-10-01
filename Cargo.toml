@@ -122,7 +122,11 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # * No performance regression (hyperfine, 50 runs, 10 warmup, median):
 #   sample-4 189.0 -> 170.7 ms, sample1 56.2 -> 52.9 ms, sample4 424.1 ->
 #   418.6 ms. The binary also shrank 93,536 bytes.
-skia-safe = { version = "0.99", features = ["embed-freetype", "textlayout"] }
+# `embed-freetype` is a (default) feature below rather than hard-wired here: a
+# fully static musl build links the system `libfreetype.a` for fontconfig, and
+# a second, embedded FreeType in the same binary leaves fontconfig calling a
+# FreeType it was not built against (every `FcFontMatch` then reports no match).
+skia-safe = { version = "0.99", features = ["textlayout"] }
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
@@ -238,7 +242,9 @@ icu_segmenter = { version = "2.2.0", default-features = false, features = ["auto
 quick-xml = { path = "vendor/quick-xml-0.41.0" }
 
 [features]
-default = ["subset-fonts"]
+default = ["subset-fonts", "embed-freetype"]
+# Skia's own FreeType instead of the system's (see the `skia-safe` line above).
+embed-freetype = ["skia-safe/embed-freetype"]
 python = ["pyo3"]
 # The Go bindings' C ABI (`src/capi.rs`), consumed via cgo against the
 # `staticlib` artifact above. No dependency of its own — unlike `python`,
