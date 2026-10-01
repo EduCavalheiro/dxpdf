@@ -394,11 +394,7 @@ pub fn render_with_font_mgr(
 
     let t = Instant::now();
     #[allow(unused_mut)] // mut required only when subset-fonts is enabled
-    let mut registry = fonts::FontRegistry::build(
-        font_mgr.clone(),
-        &resolved.embedded_fonts,
-        &resolved.font_families,
-    )?;
+    let mut registry = fonts::FontRegistry::build(font_mgr.clone(), &resolved.embedded_fonts)?;
     log::debug!("  registry: {:?}", t.elapsed());
 
     let t = Instant::now();
@@ -427,9 +423,8 @@ pub fn resolve_and_layout(doc: Document) -> (ResolvedDocument, Vec<LayoutedPage>
     let resolved = resolve::resolve(doc);
     // A debug/test helper: it always supplies the real system `FontMgr`, so
     // the font-less case `build` guards against cannot arise here.
-    let registry =
-        fonts::FontRegistry::build(font_mgr, &resolved.embedded_fonts, &resolved.font_families)
-            .expect("the system FontMgr exposes at least one typeface");
+    let registry = fonts::FontRegistry::build(font_mgr, &resolved.embedded_fonts)
+        .expect("the system FontMgr exposes at least one typeface");
     let pages = layout_document(&resolved, &registry);
     (resolved, pages)
 }
@@ -1227,7 +1222,7 @@ mod tests {
         let doc = empty_doc();
         let resolved = resolve::resolve(doc);
         let font_mgr = skia_safe::FontMgr::new();
-        let registry = fonts::FontRegistry::build(font_mgr, &[], &[]).expect("registry");
+        let registry = fonts::FontRegistry::build(font_mgr, &[]).expect("registry");
         let measurer = layout::measurer::TextMeasurer::new(&registry);
         let ctx = layout::build::BuildContext {
             measurer: &measurer,

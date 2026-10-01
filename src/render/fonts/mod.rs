@@ -287,8 +287,16 @@ impl FontRegistry {
         }
     }
 
-    /// Build a registry, registering all embedded fonts and preloading the
-    /// requested family/style combinations.
+    /// Build a registry and register all embedded fonts. Families are resolved
+    /// lazily, on first measurement, so only the faces some run actually uses
+    /// are looked up.
+    ///
+    /// Resolving every family the document *mentions* up front (the previous
+    /// behaviour, still available as [`Self::preload`]) paid for the theme's
+    /// script fallbacks too — Word themes name ~30 faces such as `Mangal`,
+    /// `MS Mincho` or `Sylfaen`, and on a host without them each one falls
+    /// through to the slow host-metadata tier. Measured on a 74-page report:
+    /// 454 ms of registry time, against ~4 ms for the faces it draws.
     ///
     /// Fails with [`crate::render::error::RenderError::NoFontsAvailable`] when the host exposes no
     /// typeface at all. Checking here rather than at the point of use is what
@@ -298,7 +306,6 @@ impl FontRegistry {
     pub fn build(
         font_mgr: FontMgr,
         embedded: &[EmbeddedFont],
-        families: &[String],
     ) -> Result<Self, crate::render::error::RenderError> {
         if font_mgr
             .legacy_make_typeface(None::<&str>, FontStyle::normal())
@@ -312,7 +319,6 @@ impl FontRegistry {
                 log::warn!("{err}");
             }
         }
-        reg.preload(families);
         Ok(reg)
     }
 
