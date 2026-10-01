@@ -1166,6 +1166,17 @@ where
                     // appears inline with the surrounding paragraph.
                     for primitive in &pict.primitives {
                         let common = primitive.common();
+                        // §14.1.2.19: `<v:shape type="#_x0000_t75"><v:imagedata/>`
+                        // (or `<v:image>`) without `position:absolute` is an
+                        // inline picture — the shape PhpWord and Word 2003
+                        // emit (`mso-position-*-relative:char/line`,
+                        // `<w10:wrap type="inline"/>`). Absolutely positioned
+                        // pictures ride `extract_vml_floating_images` instead;
+                        // before this arm the inline ones reached neither path
+                        // and vanished.
+                        if let Some(fragment) = inline_vml_picture(primitive) {
+                            fragments.push(fragment);
+                        }
                         if let Some(ref text_box) = common.text_box {
                             for block in &text_box.content {
                                 if let Block::Paragraph(p) = block {
@@ -1205,12 +1216,104 @@ where
     fragments
 }
 
+/// An inline VML picture as an image fragment: a `<v:image>`, or a
+/// `<v:shape>` carrying `<v:imagedata r:id>` and no text box, whose style is
+/// not `position:absolute` and whose `width`/`height` are absolute lengths.
+/// `None` for everything else — floating pictures, text-bearing shapes, and
+/// sizes in `%`/`em`, which have no box to resolve against here.
+fn inline_vml_picture(primitive: &crate::model::VmlPrimitive) -> Option<Fragment> {
+    use crate::model::{CssPosition, VmlPrimitive};
+    let common = match primitive {
+        VmlPrimitive::Image(img) => &img.common,
+        VmlPrimitive::Shape(s) if s.common.text_box.is_none() => &s.common,
+        _ => return None,
+    };
+    if common.style.position == Some(CssPosition::Absolute) {
+        return None;
+    }
+    let rel_id = common.image_data.as_ref()?.rel_id.as_ref()?;
+    let width = Pt::new(common.style.width?.to_absolute_points()?);
+    let height = Pt::new(common.style.height?.to_absolute_points()?);
+    if width <= Pt::ZERO || height <= Pt::ZERO {
+        return None;
+    }
+    Some(Fragment::Image {
+        size: PtSize::new(width, height),
+        rel_id: rel_id.as_str().to_string(),
+        image_data: None,
+        src_rect: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::dimension::{Dimension, HalfPoints};
     use crate::model::*;
     use crate::render::fonts::Toggle;
+
+    // ── §14.1.2.19 inline VML pictures ───────────────────────────────────
+    //
+    // `<v:shape type="#_x0000_t75" style="width:70pt;height:16.45pt"><v:imagedata r:id/>`
+    // with no `position:absolute` is the inline picture PhpWord writes into
+    // headers and footers. It used to reach neither the inline collector nor
+    // the floating extractor, and the picture disappeared.
+
+    fn vml_picture(position: Option<CssPosition>, width: Option<VmlLength>) -> VmlPrimitive {
+        let pt = |value| VmlLength {
+            value,
+            unit: VmlLengthUnit::Pt,
+        };
+        VmlPrimitive::Shape(VmlShape {
+            common: VmlCommonAttrs {
+                style: VmlStyle {
+                    position,
+                    width,
+                    height: Some(pt(16.45)),
+                    ..Default::default()
+                },
+                image_data: Some(VmlImageData {
+                    rel_id: Some(RelId::new("rId1")),
+                    title: None,
+                }),
+                ..Default::default()
+            },
+            shape_type_ref: None,
+            vml_path: None,
+        })
+    }
+
+    #[test]
+    fn inline_vml_picture_becomes_an_image_fragment_of_its_style_size() {
+        let pt70 = Some(VmlLength {
+            value: 70.0,
+            unit: VmlLengthUnit::Pt,
+        });
+        match inline_vml_picture(&vml_picture(None, pt70)) {
+            Some(Fragment::Image { size, rel_id, .. }) => {
+                assert_eq!(rel_id, "rId1");
+                assert_eq!(size.width, Pt::new(70.0));
+                assert_eq!(size.height, Pt::new(16.45));
+            }
+            other => panic!("expected an image fragment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absolute_or_relatively_sized_vml_pictures_are_not_inline() {
+        let pt70 = Some(VmlLength {
+            value: 70.0,
+            unit: VmlLengthUnit::Pt,
+        });
+        // Floating: `extract_vml_floating_images` owns it.
+        assert!(inline_vml_picture(&vml_picture(Some(CssPosition::Absolute), pt70)).is_none());
+        // `%` has no box to resolve against here.
+        let percent = Some(VmlLength {
+            value: 50.0,
+            unit: VmlLengthUnit::Percent,
+        });
+        assert!(inline_vml_picture(&vml_picture(None, percent)).is_none());
+    }
 
     /// Dummy measurer: width = text.len() * 6.0, ascent = 10.0, descent = 2.0
     fn dummy_measure(text: &str, _font: &FontProps) -> (Pt, TextMetrics) {
