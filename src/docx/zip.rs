@@ -20,7 +20,7 @@ impl PackageContents {
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
-            let name = normalize_path(file.name());
+            let name = normalize_path(&file.name()?);
             let mut buf = Vec::with_capacity(file.size() as usize);
             file.read_to_end(&mut buf)?;
             parts.insert(name, buf);

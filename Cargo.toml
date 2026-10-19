@@ -101,7 +101,7 @@ assets = [
 bitflags = "2"
 quick-xml = { version = "0.41", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # 0.93 -> 0.99 is **Skia m145 -> m150**, five upstream milestones, so it was
 # treated as a rendering change rather than a version bump. What that audit
 # found, recorded because the next bump should start from it:
