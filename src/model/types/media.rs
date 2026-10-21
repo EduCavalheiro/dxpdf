@@ -50,6 +50,15 @@ impl MediaBytes {
         }))
     }
 
+    /// Runs `f` on the bytes, read for it when lazy and dropped after:
+    /// unlike [`bytes`](Self::bytes), no shared copy of them is made.
+    pub fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        match &*self.0 {
+            Source::Loaded(bytes) => Some(f(bytes)),
+            Source::Lazy(load) => load().map(|bytes| f(&bytes)),
+        }
+    }
+
     /// This handle's identity, shared by its clones.
     pub fn id(&self) -> *const () {
         Arc::as_ptr(&self.0).cast()

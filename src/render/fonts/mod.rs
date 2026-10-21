@@ -249,7 +249,8 @@ impl OpenFaceKey {
 struct EmbeddedRecord {
     family: String,
     variant: EmbeddedFontVariant,
-    bytes: Vec<u8>,
+    /// Shared with [`FontRegistry::fork`]s.
+    bytes: std::sync::Arc<[u8]>,
 }
 
 // ─── FontRegistry ────────────────────────────────────────────────────────────
@@ -397,7 +398,7 @@ impl FontRegistry {
         self.embedded.push(EmbeddedRecord {
             family: family.to_string(),
             variant,
-            bytes,
+            bytes: bytes.into(),
         });
         log::debug!(
             "[font] registered embedded '{family}' {variant:?} ({registered} face(s), id {})",

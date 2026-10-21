@@ -219,7 +219,8 @@ pub fn render_to_pdf(
         registry,
         options,
         &mut pdf_bytes,
-    );
+    )
+    .map_err(RenderError::Write)?;
     Ok(pdf_bytes)
 }
 
@@ -243,8 +244,9 @@ pub fn render_pages_to(
         registry,
         options,
         out,
-    );
-    Ok(())
+    )
+    .map(|_| ())
+    .map_err(RenderError::Write)
 }
 
 pub(crate) fn paint_pages<P: std::borrow::Borrow<LayoutedPage>>(
@@ -254,7 +256,7 @@ pub(crate) fn paint_pages<P: std::borrow::Borrow<LayoutedPage>>(
     registry: &FontRegistry,
     options: &RenderOptions,
     out: &mut impl std::io::Write,
-) {
+) -> std::io::Result<usize> {
     // §17.3.1.19: the outline is document-level, so its structure tree has to
     // exist before the first page — `pdf::new_document` takes it by reference
     // and holds it for the document's lifetime. Layout has already finished, so
@@ -278,8 +280,14 @@ pub(crate) fn paint_pages<P: std::borrow::Borrow<LayoutedPage>>(
         structure_element_tree_root: structure_tree,
         ..Default::default()
     };
-    let mut doc = pdf::new_document(out, Some(&pdf_metadata));
+    // Skia drops a failing writer's errors; the first one is kept and returned.
+    let mut out = WriteRecorder {
+        inner: out,
+        error: None,
+    };
+    let mut doc = pdf::new_document(&mut out, Some(&pdf_metadata));
     let mut state = PaintState::new();
+    let mut painted = 0;
     for (index, page) in pages.enumerate() {
         let page = page.borrow();
         let mut on_page = doc.begin_page(to_size(page.page_size), None);
@@ -288,12 +296,39 @@ pub(crate) fn paint_pages<P: std::borrow::Borrow<LayoutedPage>>(
             render_page(canvas, page, registry, &mut state, options);
         }
         doc = on_page.end_page();
+        painted += 1;
         state
             .image_cache
             .retain(|key, _| last_uses.get(key).is_some_and(|&last| last > index));
     }
 
     doc.close();
+    if let Some(e) = out.error {
+        return Err(e);
+    }
+    out.inner.flush()?;
+    Ok(painted)
+}
+
+/// Passes writes through and keeps the first error, which Skia's writer drops.
+struct WriteRecorder<'a, W: std::io::Write> {
+    inner: &'a mut W,
+    error: Option<std::io::Error>,
+}
+
+impl<W: std::io::Write> std::io::Write for WriteRecorder<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.error.is_some() {
+            return Err(std::io::Error::other("an earlier write failed"));
+        }
+        self.inner
+            .write(buf)
+            .inspect_err(|e| self.error = Some(std::io::Error::new(e.kind(), e.to_string())))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Mutable per-render caches, shared across every page and bundled into one
@@ -974,12 +1009,11 @@ fn paint_effect(
 /// Returns `None` if the format is unsupported or the data is malformed.
 fn decode_image(entry: &MediaEntry) -> Option<skia_safe::Image> {
     use crate::model::ImageFormat;
-    let bytes = entry.data.bytes()?;
-    match entry.format {
-        ImageFormat::Emf => crate::render::emf::decode_emf_bitmap(&bytes),
+    entry.data.with_bytes(|bytes| match entry.format {
+        ImageFormat::Emf => crate::render::emf::decode_emf_bitmap(bytes),
         // All other formats are handled by Skia's built-in decoder.
-        _ => skia_safe::Image::from_encoded(Data::new_copy(&bytes)),
-    }
+        _ => skia_safe::Image::from_encoded(Data::new_copy(bytes)),
+    })?
 }
 
 /// Downsample an image if its native pixel dimensions significantly exceed

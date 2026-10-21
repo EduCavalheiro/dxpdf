@@ -87,18 +87,29 @@ pub fn render_to(
         next_page: 0,
         error: None,
     };
-    painter::paint_pages(
+    let expected = facts.total_pages + facts.extra_pages;
+    let painted = painter::paint_pages(
         structure_tree,
         facts.last_uses,
         std::iter::from_fn(|| pages.next_page()),
         &paint_registry,
         options,
         out,
-    );
-    match pages.error {
-        Some(e) => Err(e),
-        None => Ok(()),
+    )
+    .map_err(crate::render::error::RenderError::Write)?;
+    // On an error here `out` holds a closed PDF of fewer pages; the caller
+    // gets the error and discards it.
+    if let Some(e) = pages.error {
+        return Err(e);
     }
+    if painted != expected {
+        return Err(crate::render::error::RenderError::PassesDiverged {
+            laid_out: expected,
+            painted,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// The sections of a streamed body, in order, read ahead as far as laying
@@ -190,6 +201,9 @@ struct Facts {
     clock: (crate::field::context::Date, crate::field::context::Time),
     /// NUMPAGES: the pages of the sections, the endnote page aside.
     total_pages: usize,
+    /// Pages painted after the sections: the endnote page, or the blank
+    /// page of a document with no other.
+    extra_pages: usize,
     #[cfg(feature = "subset-fonts")]
     usage: crate::render::subset::collect::CodepointUsage,
     /// The outline marks of every page, in order (pages carrying only those).
@@ -251,6 +265,7 @@ fn first_pass(
     let mut facts = Facts {
         clock: layout.clock(),
         total_pages: 0,
+        extra_pages: 0,
         #[cfg(feature = "subset-fonts")]
         usage: Default::default(),
         outline: Vec::new(),
@@ -295,6 +310,9 @@ fn first_pass(
         let pages = [page];
         facts.note(&pages, page_count, registry, image_dpi);
         facts.note_outline(&pages);
+        facts.extra_pages = 1;
+    } else if page_count == 0 {
+        facts.extra_pages = 1;
     }
     Ok(facts)
 }

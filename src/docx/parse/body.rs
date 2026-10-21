@@ -152,32 +152,49 @@ pub enum BodyItem {
 pub struct BodyStream {
     items: std::sync::mpsc::Receiver<BodyItem>,
     reader: Option<std::thread::JoinHandle<Result<()>>>,
+    /// The reader thread could not be started.
+    failed_start: Option<std::io::Error>,
     rels: crate::docx::relationships::Relationships,
 }
 
+/// The reader thread's stack. Deserializing nests frames per XML level, so
+/// nested tables go deep: Rust's 2 MiB default overflows around 300 levels,
+/// which aborts the process, where the caller's thread (8 MiB, usually)
+/// parsed the same document. Reserved, not committed: unused, it costs
+/// address space only.
+const READER_STACK: usize = 64 << 20;
+
 impl BodyStream {
     pub(crate) fn start(
-        xml: std::sync::Arc<[u8]>,
+        xml: std::sync::Arc<Vec<u8>>,
         rels: crate::docx::relationships::Relationships,
     ) -> Self {
         let (sink, items) = std::sync::mpsc::sync_channel(STREAM_DEPTH);
-        let reader = std::thread::spawn(move || {
-            crate::docx::parse::serde_xml::reset_unknown_child_log();
-            if xml.is_empty() {
-                let _ = sink.send(BodyItem::End(Box::default()));
-                return Ok(());
-            }
-            BODY_SINK.with(|s| *s.borrow_mut() = Some(sink.clone()));
-            let doc: Result<DocXml> = from_xml(&xml);
-            BODY_SINK.with(|s| s.borrow_mut().take());
-            let (rest, final_section) = doc?.body.children.0.finish();
-            debug_assert!(rest.is_empty(), "every block was streamed");
-            let _ = sink.send(BodyItem::End(Box::new(final_section.unwrap_or_default())));
-            Ok(())
-        });
+        let reader = std::thread::Builder::new()
+            .name("dxpdf-body".into())
+            .stack_size(READER_STACK)
+            .spawn(move || {
+                crate::docx::parse::serde_xml::reset_unknown_child_log();
+                if xml.is_empty() {
+                    let _ = sink.send(BodyItem::End(Box::default()));
+                    return Ok(());
+                }
+                BODY_SINK.with(|s| *s.borrow_mut() = Some(sink.clone()));
+                let doc: Result<DocXml> = from_xml(&xml);
+                BODY_SINK.with(|s| s.borrow_mut().take());
+                let (rest, final_section) = doc?.body.children.0.finish();
+                debug_assert!(rest.is_empty(), "every block was streamed");
+                let _ = sink.send(BodyItem::End(Box::new(final_section.unwrap_or_default())));
+                Ok(())
+            });
+        let (reader, failed_start) = match reader {
+            Ok(reader) => (Some(reader), None),
+            Err(e) => (None, Some(e)),
+        };
         BodyStream {
             items,
-            reader: Some(reader),
+            reader,
+            failed_start,
             rels,
         }
     }
@@ -185,6 +202,9 @@ impl BodyStream {
     /// The next block, or the final section after the last one; `Ok(None)`
     /// once that was returned. A parse error is returned where it occurs.
     pub fn next_item(&mut self) -> Result<Option<BodyItem>> {
+        if let Some(e) = self.failed_start.take() {
+            return Err(e.into());
+        }
         match self.items.recv() {
             Ok(BodyItem::Block(mut block)) => {
                 super::resolve_hyperlinks(std::slice::from_mut(&mut block), &self.rels);
@@ -193,10 +213,11 @@ impl BodyStream {
             Ok(end) => Ok(Some(end)),
             // The reader is done: it either sent `End` before (consumed) or failed.
             Err(_) => match self.reader.take() {
-                Some(reader) => reader
-                    .join()
-                    .expect("the body reader does not panic")
-                    .map(|()| None),
+                Some(reader) => match reader.join() {
+                    Ok(read) => read.map(|()| None),
+                    // A panic in the reader is the caller's, as it was before there was a thread.
+                    Err(payload) => std::panic::resume_unwind(payload),
+                },
                 None => Ok(None),
             },
         }

@@ -28,8 +28,8 @@ use crate::docx::zip::{self, PackageContents};
 fn detect_format(target: &str, media: &MediaBytes) -> ImageFormat {
     match ImageFormat::detect(target, &[]) {
         ImageFormat::Unknown => media
-            .bytes()
-            .map_or(ImageFormat::Unknown, |b| ImageFormat::detect(target, &b)),
+            .with_bytes(|b| ImageFormat::detect(target, b))
+            .unwrap_or(ImageFormat::Unknown),
         known => known,
     }
 }
@@ -56,7 +56,7 @@ pub struct Frame {
 
 /// The main document part of a [`Frame`], unparsed.
 pub struct BodySource {
-    document_xml: std::sync::Arc<[u8]>,
+    document_xml: std::sync::Arc<Vec<u8>>,
     doc_rels: Relationships,
 }
 
@@ -68,7 +68,7 @@ pub fn parse_frame(package: PackageContents) -> Result<Frame> {
     Ok(Frame {
         document,
         body: BodySource {
-            document_xml: document_xml.into(),
+            document_xml: std::sync::Arc::new(document_xml),
             doc_rels,
         },
     })
