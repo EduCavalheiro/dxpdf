@@ -50,7 +50,7 @@ impl BuildContext<'_> {
 }
 
 /// Mutable state threaded through the recursive tree walk.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BuildState {
     /// Page configuration for the current section.
     pub page_config: crate::render::layout::page::PageConfig,

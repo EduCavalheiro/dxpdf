@@ -257,7 +257,8 @@ struct EmbeddedRecord {
 pub struct FontRegistry {
     font_mgr: FontMgr,
     embedded: Vec<EmbeddedRecord>,
-    catalog: FaceCatalog,
+    /// Shared with [`Self::fork`]s; only registering an embedded font changes it.
+    catalog: std::rc::Rc<FaceCatalog>,
     typefaces: RefCell<HashMap<FaceRequestKey, TypefaceEntry>>,
     /// One Skia typeface per catalogue face, so a face reached by two different
     /// requests is the *same* typeface.
@@ -278,7 +279,7 @@ impl FontRegistry {
     /// Empty registry without any embedded fonts.
     pub fn new(font_mgr: FontMgr) -> Self {
         Self {
-            catalog: FaceCatalog::build(font_mgr.clone()),
+            catalog: std::rc::Rc::new(FaceCatalog::build(font_mgr.clone())),
             font_mgr,
             embedded: Vec::new(),
             typefaces: RefCell::new(HashMap::new()),
@@ -384,7 +385,8 @@ impl FontRegistry {
             let Some(typeface) = self.open_embedded_typeface(&bytes, collection_index) else {
                 continue;
             };
-            self.catalog
+            std::rc::Rc::get_mut(&mut self.catalog)
+                .expect("embedded fonts are registered before the registry is forked")
                 .add_embedded_face(id, collection_index, family, &typeface);
             registered += 1;
         }
@@ -844,6 +846,21 @@ impl FontRegistry {
             }
         }
         count
+    }
+
+    /// A second registry over the same catalogue and the typefaces resolved
+    /// so far: subsetting one ([`crate::render::subset::apply`]) leaves the
+    /// other measuring with the original faces. The typefaces are shared, so
+    /// a [`TypefaceId`] names the same face in both.
+    pub fn fork(&self) -> Self {
+        Self {
+            font_mgr: self.font_mgr.clone(),
+            embedded: self.embedded.clone(),
+            catalog: std::rc::Rc::clone(&self.catalog),
+            typefaces: RefCell::new(self.typefaces.borrow().clone()),
+            faces: RefCell::new(self.faces.borrow().clone()),
+            warned: RefCell::new(self.warned.borrow().clone()),
+        }
     }
 
     /// Snapshot of all cached entries.

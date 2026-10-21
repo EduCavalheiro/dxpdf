@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use crate::model::dimension::{Dimension, Twips};
 use crate::model::{
     Block, Document, EmbeddedFont, NoteId, NumId, NumPicBullet, NumPicBulletId,
-    ParagraphProperties, RelId, RunProperties, StyleId, Theme,
+    ParagraphProperties, RelId, RunProperties, SectionProperties, StyleId, Theme,
 };
 
 use self::images::MediaEntry;
@@ -91,6 +91,36 @@ pub struct ResolvedDocument {
 /// their sources by reference, because each produces a new value rather than
 /// re-homing the old one.
 pub fn resolve(doc: Document) -> ResolvedDocument {
+    let (mut resolved, body, final_section, parts) = resolve_parts(doc);
+    resolved.sections =
+        sections::resolve_sections(body, final_section, &parts.headers, &parts.footers);
+    resolved
+}
+
+/// The header and footer parts of a document, by relationship id: what its
+/// sections take their header and footer content from.
+pub struct HeaderFooterParts {
+    pub headers: HashMap<RelId, Vec<Block>>,
+    pub footers: HashMap<RelId, Vec<Block>>,
+}
+
+/// [`resolve`] for a document whose body is read separately (a
+/// [`Frame`](crate::docx::parse::Frame)'s): `sections` is empty, and the
+/// sections are built from the body's blocks with a
+/// [`SectionSplitter`](sections::SectionSplitter) over the returned parts.
+pub fn resolve_frame(doc: Document) -> (ResolvedDocument, HeaderFooterParts) {
+    let (resolved, _, _, parts) = resolve_parts(doc);
+    (resolved, parts)
+}
+
+fn resolve_parts(
+    doc: Document,
+) -> (
+    ResolvedDocument,
+    Vec<Block>,
+    SectionProperties,
+    HeaderFooterParts,
+) {
     use crate::model::StyleType;
 
     let font_families = fonts::collect_font_families(&doc);
@@ -127,10 +157,8 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
 
     let resolved_styles = styles::resolve_styles(&styles, theme.as_ref());
     let resolved_numbering = numbering::resolve_numbering(&numbering);
-    let sections = sections::resolve_sections(body, final_section, &headers, &footers);
-
-    ResolvedDocument {
-        sections,
+    let resolved = ResolvedDocument {
+        sections: Vec::new(),
         styles: resolved_styles,
         numbering: resolved_numbering,
         font_families,
@@ -149,7 +177,13 @@ pub fn resolve(doc: Document) -> ResolvedDocument {
         embedded_fonts,
         even_and_odd_headers: settings.even_and_odd_headers,
         default_tab_stop: settings.default_tab_stop,
-    }
+    };
+    (
+        resolved,
+        body,
+        final_section,
+        HeaderFooterParts { headers, footers },
+    )
 }
 
 #[cfg(test)]
@@ -322,7 +356,7 @@ mod tests {
         doc.media.insert(
             RelId::new("rId1"),
             (
-                std::sync::Arc::from(&[0xFF_u8, 0xD8, 0xFF][..]),
+                crate::model::MediaBytes::from_bytes(&[0xFF_u8, 0xD8, 0xFF][..]),
                 ImageFormat::Jpeg,
             ),
         );
@@ -330,7 +364,7 @@ mod tests {
         let resolved = resolve(doc);
         assert!(resolved.media.contains_key(&RelId::new("rId1")));
         let entry = &resolved.media[&RelId::new("rId1")];
-        assert_eq!(&*entry.data, &[0xFF_u8, 0xD8, 0xFF][..]);
+        assert_eq!(&*entry.data.bytes().unwrap(), &[0xFF_u8, 0xD8, 0xFF][..]);
         assert_eq!(entry.format, ImageFormat::Jpeg);
     }
 
@@ -340,18 +374,18 @@ mod tests {
     /// catch a regression here.
     #[test]
     fn resolve_shares_media_bytes_rather_than_copying_them() {
-        use crate::model::ImageFormat;
-        use std::sync::Arc;
+        use crate::model::{ImageFormat, MediaBytes};
 
-        let bytes: Arc<[u8]> = Arc::from(&[0xFF_u8, 0xD8, 0xFF][..]);
+        let bytes = MediaBytes::from_bytes(&[0xFF_u8, 0xD8, 0xFF][..]);
         let mut doc = empty_doc();
         doc.media
-            .insert(RelId::new("rId1"), (Arc::clone(&bytes), ImageFormat::Jpeg));
+            .insert(RelId::new("rId1"), (bytes.clone(), ImageFormat::Jpeg));
 
         let resolved = resolve(doc);
-        assert!(
-            Arc::ptr_eq(&resolved.media[&RelId::new("rId1")].data, &bytes),
-            "resolve must pass the parser's allocation through, not a copy of it",
+        assert_eq!(
+            resolved.media[&RelId::new("rId1")].data.id(),
+            bytes.id(),
+            "resolve must pass the parser's handle through, not a copy of it",
         );
     }
 

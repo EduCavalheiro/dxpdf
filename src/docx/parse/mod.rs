@@ -17,23 +17,103 @@ pub mod theme;
 pub mod vml;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::docx::error::{ParseError, Result};
 use crate::docx::model::*;
 use crate::docx::relationships::{RelationshipType, Relationships};
 use crate::docx::zip::{self, PackageContents};
 
+/// [`ImageFormat::detect`] on a media handle: the extension decides when it
+/// can, so a handle is only read when it cannot.
+fn detect_format(target: &str, media: &MediaBytes) -> ImageFormat {
+    match ImageFormat::detect(target, &[]) {
+        ImageFormat::Unknown => media
+            .bytes()
+            .map_or(ImageFormat::Unknown, |b| ImageFormat::detect(target, &b)),
+        known => known,
+    }
+}
+
 /// Parse a DOCX file from raw bytes into a `Document`.
 pub fn parse(data: &[u8]) -> Result<Document> {
+    // Phase 1: Unzip
+    parse_package(PackageContents::from_bytes(data)?)
+}
+
+/// Parse an already opened package: a caller that provides its media as
+/// handles ([`PackageContents::with_media`]) parses without holding them.
+pub fn parse_package(package: PackageContents) -> Result<Document> {
+    parse_parts(package, BodyMode::Parse).map(|(document, _)| document)
+}
+
+/// Everything of a document but its body: the body is read later, block by
+/// block ([`BodySource::stream_body`]), or whole ([`BodySource::body`]).
+pub struct Frame {
+    /// The document, with an empty `body` and a default `final_section`.
+    pub document: Document,
+    pub body: BodySource,
+}
+
+/// The main document part of a [`Frame`], unparsed.
+pub struct BodySource {
+    document_xml: std::sync::Arc<[u8]>,
+    doc_rels: Relationships,
+}
+
+/// [`parse_package`] without the body. The other parts parse as they do
+/// there; the main document part only has to exist.
+pub fn parse_frame(package: PackageContents) -> Result<Frame> {
+    let (document, deferred) = parse_parts(package, BodyMode::Defer)?;
+    let (document_xml, doc_rels) = deferred.expect("a deferred body is returned");
+    Ok(Frame {
+        document,
+        body: BodySource {
+            document_xml: document_xml.into(),
+            doc_rels,
+        },
+    })
+}
+
+impl BodySource {
+    /// The body as [`parse_package`] reads it: blocks and the final section.
+    pub fn body(&self) -> Result<(Vec<Block>, SectionProperties)> {
+        let (mut blocks, final_section) = body::parse_body(&self.document_xml)?;
+        resolve_hyperlinks(&mut blocks, &self.doc_rels);
+        Ok((blocks, final_section))
+    }
+
+    /// The body, one top-level block at a time, read on a thread of its own
+    /// so that only a bounded number of converted blocks wait for the
+    /// consumer: the body is never held whole. The blocks, and the final
+    /// section after them, are those [`Self::body`] returns.
+    pub fn stream_body(&self) -> body::BodyStream {
+        body::BodyStream::start(
+            std::sync::Arc::clone(&self.document_xml),
+            self.doc_rels.clone(),
+        )
+    }
+}
+
+/// What [`parse_parts`] does with the main document part.
+enum BodyMode {
+    Parse,
+    /// Leave it unparsed and hand it back, with the relationships its blocks resolve against.
+    Defer,
+}
+
+/// A body [`BodyMode::Defer`] left unparsed: the main document part and the
+/// relationships its blocks resolve against.
+type DeferredBody = (Vec<u8>, Relationships);
+
+fn parse_parts(
+    mut package: PackageContents,
+    body_mode: BodyMode,
+) -> Result<(Document, Option<DeferredBody>)> {
     // Unmodelled-property reporting is deduplicated per document, so the set
     // has to be forgotten here rather than kept for the process — otherwise
     // the second document rendered would look clean because the first already
     // logged the same name. See `serde_xml::UnknownChildren::warn_once`.
     serde_xml::reset_unknown_child_log();
-
-    // Phase 1: Unzip
-    let mut package = PackageContents::from_bytes(data)?;
 
     // Phase 1b: Find main document part via package-level rels
     let pkg_rels_data = package.require_part("_rels/.rels")?;
@@ -109,14 +189,15 @@ pub fn parse(data: &[u8]) -> Result<Document> {
     // package is dropped at the end of parse, so the transient duplication is
     // bounded.
     //
-    // This is the pipeline's only copy of an image. `Document.media` holds
-    // `Arc<[u8]>`, so resolve, layout and paint all pass the same allocation
-    // around by handle.
+    // This is the pipeline's only copy of an image. `Document.media` holds a
+    // `MediaBytes` handle, so resolve, layout and paint all pass the same
+    // bytes around by handle (or, for media the caller provided as handles,
+    // read them only when painting).
     let mut media = HashMap::new();
     for rel in doc_rels.filter_by_type(&RelationshipType::Image) {
         let media_path = zip::resolve_target(doc_dir, &rel.target);
-        if let Some(data) = package.get_part(&media_path).map(Arc::<[u8]>::from) {
-            let fmt = ImageFormat::detect(&rel.target, &data);
+        if let Some(data) = package.media(&media_path) {
+            let fmt = detect_format(&rel.target, &data);
             media.insert(rel.id.clone(), (data, fmt));
         }
     }
@@ -136,8 +217,8 @@ pub fn parse(data: &[u8]) -> Result<Document> {
             let mut num_remap: HashMap<RelId, RelId> = HashMap::new();
             for rel in num_rels.filter_by_type(&RelationshipType::Image) {
                 let img_path = zip::resolve_target(num_dir, &rel.target);
-                if let Some(data) = package.get_part(&img_path).map(Arc::<[u8]>::from) {
-                    let fmt = ImageFormat::detect(&rel.target, &data);
+                if let Some(data) = package.media(&img_path) {
+                    let fmt = detect_format(&rel.target, &data);
                     let unique_id = RelId::new(format!("{}::{}", num_path, rel.id.as_str()));
                     media.insert(unique_id.clone(), (data, fmt));
                     num_remap.insert(rel.id.clone(), unique_id);
@@ -174,8 +255,20 @@ pub fn parse(data: &[u8]) -> Result<Document> {
     };
 
     // Phase 3: Parse document body
-    let doc_data = package.require_part(&doc_path)?;
-    let (mut body_blocks, final_section) = body::parse_body(doc_data)?;
+    let (mut body_blocks, final_section, deferred_body) = match body_mode {
+        BodyMode::Parse => {
+            let doc_data = package.require_part(&doc_path)?;
+            let (blocks, final_section) = body::parse_body(doc_data)?;
+            (blocks, final_section, None)
+        }
+        BodyMode::Defer => {
+            package.require_part(&doc_path)?;
+            let doc_data = package
+                .take_part(&doc_path)
+                .expect("the part was just found");
+            (Vec::new(), SectionProperties::default(), Some(doc_data))
+        }
+    };
 
     // Phase 4: Parse headers and footers
     let mut headers = HashMap::new();
@@ -234,8 +327,10 @@ pub fn parse(data: &[u8]) -> Result<Document> {
     // that pass is the per-part equivalent of this body-level resolve.
     resolve_hyperlinks(&mut body_blocks, &doc_rels);
 
+    let deferred_body = deferred_body.map(|xml| (xml, doc_rels.clone()));
+
     // Phase 6: Assemble
-    Ok(Document {
+    let document = Document {
         settings: doc_settings,
         theme,
         styles: style_sheet,
@@ -248,7 +343,8 @@ pub fn parse(data: &[u8]) -> Result<Document> {
         endnotes,
         media,
         embedded_fonts,
-    })
+    };
+    Ok((document, deferred_body))
 }
 
 /// Process the rels of a single subordinate XML part — a header,
@@ -277,7 +373,7 @@ pub fn parse(data: &[u8]) -> Result<Document> {
 fn load_part_rel_remap(
     part_path: &str,
     package: &mut PackageContents,
-    media: &mut HashMap<RelId, (Arc<[u8]>, ImageFormat)>,
+    media: &mut HashMap<RelId, (MediaBytes, ImageFormat)>,
 ) -> Result<HashMap<RelId, RelId>> {
     let mut remap: HashMap<RelId, RelId> = HashMap::new();
     let rels_path = zip::rels_path_for(part_path);
@@ -293,8 +389,8 @@ fn load_part_rel_remap(
         // footer) commonly reference the *same* image part; if we
         // moved the bytes out at the first reader the second reader
         // would silently drop the image.
-        if let Some(img_data) = package.get_part(&img_path).map(Arc::<[u8]>::from) {
-            let fmt = ImageFormat::detect(&img_rel.target, &img_data);
+        if let Some(img_data) = package.media(&img_path) {
+            let fmt = detect_format(&img_rel.target, &img_data);
             let unique_id = RelId::new(format!("{}::{}", part_path, img_rel.id.as_str()));
             media.insert(unique_id.clone(), (img_data, fmt));
             remap.insert(img_rel.id.clone(), unique_id);

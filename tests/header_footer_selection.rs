@@ -683,8 +683,8 @@ fn vorlage_baustellenkoordinator_v12_per_part_image_rels_do_not_collide() {
         .get(&dxpdf::model::RelId::new("word/footer3.xml::rId1"))
         .expect("footer3's image must have its own synthesized media entry");
     assert_ne!(
-        header3_logo.0.len(),
-        footer3_image.0.len(),
+        header3_logo.0.bytes().unwrap().len(),
+        footer3_image.0.bytes().unwrap().len(),
         "header and footer images must point at different bytes — if \
          they're equal we may have re-introduced the rId collision"
     );

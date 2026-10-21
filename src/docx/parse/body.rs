@@ -20,8 +20,7 @@ pub fn parse_body(data: &[u8]) -> Result<(Vec<Block>, SectionProperties)> {
         return Ok((Vec::new(), SectionProperties::default()));
     }
     let doc: DocXml = from_xml(data)?;
-    let mut ctx = ConvertCtx::new();
-    let (blocks, final_section) = convert_container(doc.body.children, &mut ctx);
+    let (blocks, final_section) = doc.body.children.0.finish();
     Ok((blocks, final_section.unwrap_or_default()))
 }
 
@@ -43,7 +42,57 @@ use serde::Deserialize;
 /// Thin wrapper for `<w:document>` — just extracts `<w:body>`.
 #[derive(Deserialize)]
 struct DocXml {
-    body: BlockContainerXml,
+    body: StreamedBodyXml,
+}
+
+/// `<w:body>` whose children are converted as they are read, so the serde
+/// tree of the document never exists whole: only that of the block being
+/// read, next to the blocks already converted. The model is the one
+/// [`convert_container`] builds from the whole tree: children are converted
+/// one at a time, in order, either way.
+#[derive(Deserialize, Default)]
+struct StreamedBodyXml {
+    #[serde(rename = "$value", default)]
+    children: ConvertedChildren,
+}
+
+#[derive(Default)]
+struct ConvertedChildren(ContainerBuilder);
+
+impl<'de> Deserialize<'de> for ConvertedChildren {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Children;
+        impl<'de> serde::de::Visitor<'de> for Children {
+            type Value = ConvertedChildren;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("block-level children")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut builder = ContainerBuilder::default();
+                let mut ctx = ConvertCtx::new();
+                let sink = BODY_SINK.with(|s| s.borrow_mut().take());
+                while let Some(child) = seq.next_element::<BlockChildXml>()? {
+                    builder.push(child, &mut ctx);
+                    if let Some(sink) = &sink {
+                        for block in builder.blocks.drain(..) {
+                            // The consumer stopped (it failed, or was dropped): stop reading.
+                            sink.send(BodyItem::Block(block))
+                                .map_err(|_| serde::de::Error::custom(CONSUMER_GONE))?;
+                        }
+                    }
+                }
+                Ok(ConvertedChildren(builder))
+            }
+        }
+        deserializer.deserialize_seq(Children)
+    }
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────
@@ -70,9 +119,100 @@ pub(crate) fn convert_container(
     children: Vec<BlockChildXml>,
     ctx: &mut ConvertCtx,
 ) -> (Vec<Block>, Option<SectionProperties>) {
-    let mut blocks = Vec::new();
-    let mut final_section = None;
+    let mut builder = ContainerBuilder::default();
     for child in children {
+        builder.push(child, ctx);
+    }
+    builder.finish()
+}
+
+thread_local! {
+    /// Where the body's blocks go as they are converted, on a [`BodyStream`]'s
+    /// thread: taken by the body's children, so a nested container (an SDT,
+    /// a cell) is never streamed.
+    static BODY_SINK: std::cell::RefCell<Option<std::sync::mpsc::SyncSender<BodyItem>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+const CONSUMER_GONE: &str = "the body's consumer is gone";
+
+/// How many converted blocks may wait for a [`BodyStream`]'s consumer.
+const STREAM_DEPTH: usize = 64;
+
+/// What a [`BodyStream`] yields.
+pub enum BodyItem {
+    /// The next top-level block, in document order, hyperlinks resolved.
+    Block(Block),
+    /// After the last block: the body's final section (the trailing `w:sectPr`).
+    End(Box<SectionProperties>),
+}
+
+/// The body of a document read on a thread of its own, one converted block
+/// at a time (see [`Frame::stream_body`](super::Frame::stream_body)).
+pub struct BodyStream {
+    items: std::sync::mpsc::Receiver<BodyItem>,
+    reader: Option<std::thread::JoinHandle<Result<()>>>,
+    rels: crate::docx::relationships::Relationships,
+}
+
+impl BodyStream {
+    pub(crate) fn start(
+        xml: std::sync::Arc<[u8]>,
+        rels: crate::docx::relationships::Relationships,
+    ) -> Self {
+        let (sink, items) = std::sync::mpsc::sync_channel(STREAM_DEPTH);
+        let reader = std::thread::spawn(move || {
+            crate::docx::parse::serde_xml::reset_unknown_child_log();
+            if xml.is_empty() {
+                let _ = sink.send(BodyItem::End(Box::default()));
+                return Ok(());
+            }
+            BODY_SINK.with(|s| *s.borrow_mut() = Some(sink.clone()));
+            let doc: Result<DocXml> = from_xml(&xml);
+            BODY_SINK.with(|s| s.borrow_mut().take());
+            let (rest, final_section) = doc?.body.children.0.finish();
+            debug_assert!(rest.is_empty(), "every block was streamed");
+            let _ = sink.send(BodyItem::End(Box::new(final_section.unwrap_or_default())));
+            Ok(())
+        });
+        BodyStream {
+            items,
+            reader: Some(reader),
+            rels,
+        }
+    }
+
+    /// The next block, or the final section after the last one; `Ok(None)`
+    /// once that was returned. A parse error is returned where it occurs.
+    pub fn next_item(&mut self) -> Result<Option<BodyItem>> {
+        match self.items.recv() {
+            Ok(BodyItem::Block(mut block)) => {
+                super::resolve_hyperlinks(std::slice::from_mut(&mut block), &self.rels);
+                Ok(Some(BodyItem::Block(block)))
+            }
+            Ok(end) => Ok(Some(end)),
+            // The reader is done: it either sent `End` before (consumed) or failed.
+            Err(_) => match self.reader.take() {
+                Some(reader) => reader
+                    .join()
+                    .expect("the body reader does not panic")
+                    .map(|()| None),
+                None => Ok(None),
+            },
+        }
+    }
+}
+
+/// [`convert_container`] one child at a time.
+#[derive(Default)]
+pub(crate) struct ContainerBuilder {
+    blocks: Vec<Block>,
+    final_section: Option<SectionProperties>,
+}
+
+impl ContainerBuilder {
+    pub(crate) fn push(&mut self, child: BlockChildXml, ctx: &mut ConvertCtx) {
+        let blocks = &mut self.blocks;
         match child {
             BlockChildXml::Paragraph(p) => {
                 let (para, sect_after) = convert_paragraph(*p, ctx);
@@ -85,7 +225,7 @@ pub(crate) fn convert_container(
                 blocks.push(Block::Table(Box::new(convert_table(*t, ctx))));
             }
             BlockChildXml::SectPr(sp) => {
-                final_section = Some(SectionProperties::from(*sp));
+                self.final_section = Some(SectionProperties::from(*sp));
             }
             BlockChildXml::Sdt(sdt) => {
                 // Flatten SDT wrapper — treat its content as block-level.
@@ -93,7 +233,7 @@ pub(crate) fn convert_container(
                     let (nested_blocks, nested_sect) = convert_container(content.children, ctx);
                     blocks.extend(nested_blocks);
                     if nested_sect.is_some() {
-                        final_section = nested_sect;
+                        self.final_section = nested_sect;
                     }
                 }
             }
@@ -106,7 +246,10 @@ pub(crate) fn convert_container(
             | BlockChildXml::Other => {}
         }
     }
-    (blocks, final_section)
+
+    pub(crate) fn finish(self) -> (Vec<Block>, Option<SectionProperties>) {
+        (self.blocks, self.final_section)
+    }
 }
 
 fn convert_paragraph(p: ParaXml, ctx: &mut ConvertCtx) -> (Paragraph, Option<SectionProperties>) {

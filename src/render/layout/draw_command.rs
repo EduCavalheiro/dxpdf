@@ -683,7 +683,7 @@ mod tests {
                 DrawCommand::Image {
                     rect,
                     image_data: crate::render::resolve::images::MediaEntry {
-                        data: std::sync::Arc::from(&[0u8][..]),
+                        data: crate::model::MediaBytes::from_bytes(&[0u8][..]),
                         format: crate::model::ImageFormat::Png,
                     },
                     src_rect: None,

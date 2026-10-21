@@ -22,6 +22,7 @@ pub mod resolve;
 pub mod shape;
 pub mod skia_conv;
 pub mod spacing;
+pub mod stream;
 #[cfg(feature = "subset-fonts")]
 pub mod subset;
 
@@ -99,7 +100,6 @@ impl Default for RenderOptions {
     }
 }
 
-use crate::model::Block;
 use crate::render::layout::build::{
     build_document_endnotes, build_section_blocks, default_line_height, BuildContext, BuildState,
 };
@@ -386,6 +386,30 @@ pub fn render_with_font_mgr(
     font_mgr: &skia_safe::FontMgr,
     options: &RenderOptions,
 ) -> Result<Vec<u8>, error::RenderError> {
+    let mut pdf = Vec::new();
+    render_with_font_mgr_to(doc, font_mgr, options, &mut pdf)?;
+    Ok(pdf)
+}
+
+/// [`render`] writing the PDF to `out` as each page is painted, instead of
+/// returning it whole. The bytes are the same.
+pub fn render_to(
+    doc: Document,
+    options: &RenderOptions,
+    out: &mut impl std::io::Write,
+) -> Result<(), error::RenderError> {
+    let font_mgr = skia_safe::FontMgr::new();
+    render_with_font_mgr_to(doc, &font_mgr, options, out)
+}
+
+/// [`render_with_font_mgr`] writing to `out` (see [`render_to`]). The
+/// resolved document is released once laid out, and each page once painted.
+pub fn render_with_font_mgr_to(
+    doc: Document,
+    font_mgr: &skia_safe::FontMgr,
+    options: &RenderOptions,
+    out: &mut impl std::io::Write,
+) -> Result<(), error::RenderError> {
     use std::time::Instant;
 
     let t = Instant::now();
@@ -399,6 +423,8 @@ pub fn render_with_font_mgr(
 
     let t = Instant::now();
     let pages = layout_document(&resolved, &registry);
+    // Paint needs the pages and the registry only.
+    drop(resolved);
     log::debug!("  layout:   {:?} ({} pages)", t.elapsed(), pages.len());
 
     #[cfg(feature = "subset-fonts")]
@@ -411,7 +437,7 @@ pub fn render_with_font_mgr(
     }
 
     let t = Instant::now();
-    let pdf = painter::render_to_pdf(&pages, &registry, options);
+    let pdf = painter::render_pages_to(pages, &registry, options, out);
     log::debug!("  paint:    {:?}", t.elapsed());
     pdf
 }
@@ -440,71 +466,164 @@ pub fn layout_document(
         measurer: &measurer,
         resolved,
     };
-    let mut state = BuildState::default();
-    // §17.16.5.13/§17.16.5.76: read the clock once, here, so every DATE and
-    // TIME field in the document reports the same instant even if the render
-    // crosses a second — or midnight. See `crate::field::now` for why it is
-    // UTC rather than the host's local time.
-    let (today, now_time) = crate::field::now::now();
-    state.field_ctx.date = Some(today);
-    state.field_ctx.time = Some(now_time);
-    let dlh = default_line_height(&ctx);
+    let mut layout = DocumentLayout::new(&ctx);
     let mut all_pages = Vec::new();
-    let mut last_config = PageConfig::default();
-    // Per-section metadata for deferred header/footer rendering.
-    // Carries the section's resolved slot sets, `<w:titlePg/>` flag,
-    // and logical page number of the section's first page (§17.6.12);
-    // the global `<w:evenAndOddHeaders/>` setting is read once below.
-    struct SectionHfInfo<'a> {
-        page_range: std::ops::Range<usize>,
-        config: PageConfig,
-        headers: &'a crate::render::resolve::header_footer::HeaderFooterSet<Vec<Block>>,
-        footers: &'a crate::render::resolve::header_footer::HeaderFooterSet<Vec<Block>>,
-        title_pg: bool,
-        logical_page_base: usize,
-    }
-    let mut section_hf: Vec<SectionHfInfo> = Vec::new();
-    // §17.6.12: logical PAGE numbering accumulates across sections,
-    // resetting wherever a section sets `pgNumType.start`. Document
-    // starts at logical 1 unless the first section overrides it.
-    let mut next_logical: usize = 1;
-
-    // §17.11.23: footnote separator indent from default paragraph style.
-    let separator_indent = resolved
-        .default_paragraph_style_id
-        .as_ref()
-        .and_then(|id| resolved.styles.get(id))
-        .and_then(|s| s.paragraph.indentation.get())
-        .and_then(|ind| ind.first_line)
-        .map(|fl| match fl {
-            crate::model::FirstLineIndent::FirstLine(v) => dimension::Pt::from(v),
-            _ => dimension::Pt::ZERO,
-        })
-        .unwrap_or(dimension::Pt::ZERO);
-
-    // §17.6.22: track continuation state for `Continuous` section breaks.
-    let mut pending_continuation: Option<layout::section::ContinuationState> = None;
-    let even_and_odd = resolved.even_and_odd_headers;
+    let mut section_hf = Vec::new();
 
     // Phase 1: layout all sections to determine total page count.
-    for (section_idx, section) in resolved.sections.iter().enumerate() {
+    for section_idx in 0..resolved.sections.len() {
+        let (mut pages, hf) = layout.section(&resolved.sections, section_idx);
+        let page_start = all_pages.len();
+        all_pages.append(&mut pages);
+        section_hf.push((page_start, hf));
+    }
+
+    // §17.11.2: endnotes are document-scoped — built once, after every section,
+    // so a multi-section document doesn't repeat them per section.
+    let all_endnotes = layout.endnotes();
+
+    // Phase 2: render headers/footers with correct NUMPAGES (total page count).
+    let total_pages = all_pages.len();
+    for (section, (page_start, hf)) in resolved.sections.iter().zip(&section_hf) {
+        layout.headers_footers(
+            &mut all_pages[*page_start..*page_start + hf.pages],
+            section,
+            hf,
+            *page_start,
+            total_pages,
+        );
+    }
+
+    // Render endnotes on a new page at the end of the document.
+    all_pages.extend(layout.endnote_page(&all_endnotes));
+
+    if all_pages.is_empty() {
+        all_pages.push(LayoutedPage::new(PageConfig::default().page_size));
+    }
+
+    // Last, over the finished page: fuse abutting same-colour fills so no
+    // rasterizer can leave a seam where two of them meet. Here rather than at
+    // any of the places that emit a rect, because the pairs come from several
+    // of them — table cell shading, paragraph shading, borders — and the rule
+    // is a property of the command stream, not of any one producer.
+    for page in &mut all_pages {
+        layout::draw_command::coalesce_abutting_rects(&mut page.commands);
+    }
+
+    all_pages
+}
+
+/// One endnote, as `build_document_endnotes` builds it.
+pub(crate) type DocumentEndnote = (
+    String,
+    Vec<layout::fragment::Fragment>,
+    layout::paragraph::ParagraphStyle,
+);
+
+/// What [`DocumentLayout::section`] tells phase 2 about a section's pages.
+pub(crate) struct SectionHf {
+    /// How many pages the section committed.
+    pub(crate) pages: usize,
+    pub(crate) config: PageConfig,
+    title_pg: bool,
+    /// §17.6.12: logical page number of the section's first page.
+    logical_page_base: usize,
+}
+
+/// The document-order state layout carries from one section to the next.
+/// [`layout_document`] runs every section through it, then phase 2 and the
+/// endnotes; `render::stream` runs the same steps a section at a time, so
+/// both lay out the same pages.
+pub(crate) struct DocumentLayout<'a> {
+    ctx: &'a BuildContext<'a>,
+    pub(crate) state: BuildState,
+    dlh: dimension::Pt,
+    /// §17.11.23: footnote separator indent from default paragraph style.
+    separator_indent: dimension::Pt,
+    /// §17.6.12: logical PAGE numbering accumulates across sections,
+    /// resetting wherever a section sets `pgNumType.start`. Document
+    /// starts at logical 1 unless the first section overrides it.
+    next_logical: usize,
+    /// §17.6.22: track continuation state for `Continuous` section breaks.
+    pending_continuation: Option<layout::section::ContinuationState>,
+    last_config: PageConfig,
+    even_and_odd: bool,
+}
+
+impl<'a> DocumentLayout<'a> {
+    pub(crate) fn new(ctx: &'a BuildContext<'a>) -> Self {
+        // §17.16.5.13/§17.16.5.76: read the clock once, here, so every DATE and
+        // TIME field in the document reports the same instant even if the render
+        // crosses a second — or midnight. See `crate::field::now` for why it is
+        // UTC rather than the host's local time.
+        Self::at(ctx, crate::field::now::now())
+    }
+
+    /// [`Self::new`] with the clock already read: a second layout of the same
+    /// document (`render::stream`) must report the instant the first did.
+    pub(crate) fn at(
+        ctx: &'a BuildContext<'a>,
+        (today, now_time): (crate::field::context::Date, crate::field::context::Time),
+    ) -> Self {
+        let resolved = ctx.resolved;
+        let mut state = BuildState::default();
+        state.field_ctx.date = Some(today);
+        state.field_ctx.time = Some(now_time);
+        let dlh = default_line_height(ctx);
+        let separator_indent = resolved
+            .default_paragraph_style_id
+            .as_ref()
+            .and_then(|id| resolved.styles.get(id))
+            .and_then(|s| s.paragraph.indentation.get())
+            .and_then(|ind| ind.first_line)
+            .map(|fl| match fl {
+                crate::model::FirstLineIndent::FirstLine(v) => dimension::Pt::from(v),
+                _ => dimension::Pt::ZERO,
+            })
+            .unwrap_or(dimension::Pt::ZERO);
+        DocumentLayout {
+            ctx,
+            state,
+            dlh,
+            separator_indent,
+            next_logical: 1,
+            pending_continuation: None,
+            last_config: PageConfig::default(),
+            even_and_odd: resolved.even_and_odd_headers,
+        }
+    }
+
+    /// Phase 1 for `sections[section_idx]`: its committed pages, without
+    /// headers and footers. `sections` must reach as far past it as a chain
+    /// of continuous breaks does, plus one: a shared last page looks ahead.
+    pub(crate) fn section(
+        &mut self,
+        sections: &[crate::render::resolve::sections::ResolvedSection],
+        section_idx: usize,
+    ) -> (Vec<LayoutedPage>, SectionHf) {
+        let section = &sections[section_idx];
+        let ctx = self.ctx;
+        let dlh = self.dlh;
+        let separator_indent = self.separator_indent;
+        let even_and_odd = self.even_and_odd;
         let config = PageConfig::from_section(&section.properties);
-        state.page_config = config.clone();
+        self.state.page_config = config.clone();
         let logical_page_base = layout::header_footer::next_logical_page_base(
-            next_logical,
+            self.next_logical,
             section.properties.page_number_type.get(),
         );
         let clearance = measure_header_footer_clearance(
             &config,
             section,
-            &ctx,
-            &mut state,
+            ctx,
+            &mut self.state,
             dlh,
             even_and_odd,
             logical_page_base,
         );
 
-        let built = build_section_blocks(section, &config, &ctx, &mut state);
+        let built = build_section_blocks(section, &config, ctx, &mut self.state);
+        let measurer = ctx.measurer;
         let measure_fn = |text: &str,
                           font: &layout::fragment::FontProps|
          -> (dimension::Pt, layout::fragment::TextMetrics) {
@@ -522,7 +641,7 @@ pub fn layout_document(
         let continuation = if section.properties.section_type.get()
             == Some(&crate::model::SectionType::Continuous)
         {
-            pending_continuation.take()
+            self.pending_continuation.take()
         } else {
             None
         };
@@ -530,7 +649,7 @@ pub fn layout_document(
         // §17.6.22: does a `Continuous` section follow, sharing this section's
         // last page? Not if the break is promoted to a page break instead —
         // see `continuous_break_promotes_to_page_break`.
-        let next_continuous = resolved.sections.get(section_idx + 1).is_some_and(|next| {
+        let next_continuous = sections.get(section_idx + 1).is_some_and(|next| {
             next.properties.section_type.get() == Some(&crate::model::SectionType::Continuous)
                 && !continuous_break_promotes_to_page_break(&config, &next.properties)
         });
@@ -564,7 +683,7 @@ pub fn layout_document(
             let outcome = fit_shared_page(
                 &mut layout,
                 FitSharedPage {
-                    sections: &resolved.sections,
+                    sections,
                     next_idx: section_idx + 1,
                     clearance: &clearance,
                     logical_page_base,
@@ -573,16 +692,16 @@ pub fn layout_document(
                     separator_indent,
                     measure_text: Some(&measure_fn),
                 },
-                &ctx,
-                &mut state,
+                ctx,
+                &mut self.state,
                 |bounds| lay_out(continuation.clone(), bounds),
             );
             log::debug!("[section {section_idx}] shared-page fit: {outcome:?}");
         }
 
-        last_config = config.clone();
+        self.last_config = config.clone();
 
-        let mut pages = layout.pages;
+        let pages = layout.pages;
         // ─── §17.6.22 shared-page ownership ─────────────────────────────────
         //
         // A page holding a continuous break carries content from two sections,
@@ -610,69 +729,102 @@ pub fn layout_document(
         // The shared page never entered `pages` — `finalize` put it in the tail
         // so it cannot be committed here and appended by the succeeding section
         // as well.
-        pending_continuation = match layout.tail {
+        self.pending_continuation = match layout.tail {
             layout::section::SectionTail::Complete => None,
             layout::section::SectionTail::SharedWithNext(c) => Some(c),
         };
 
-        let page_start = all_pages.len();
-        all_pages.append(&mut pages);
-        let pages_in_section = all_pages.len() - page_start;
-        next_logical = logical_page_base + pages_in_section;
-        section_hf.push(SectionHfInfo {
-            page_range: page_start..all_pages.len(),
+        self.next_logical = logical_page_base + pages.len();
+        let hf = SectionHf {
+            pages: pages.len(),
             config,
-            headers: &section.headers,
-            footers: &section.footers,
             title_pg: section.properties.title_page.unwrap_or(false),
             logical_page_base,
-        });
+        };
+        (pages, hf)
     }
 
-    // §17.11.2: endnotes are document-scoped — built once, after every section,
-    // so a multi-section document doesn't repeat them per section.
-    let all_endnotes = build_document_endnotes(&ctx, &mut state);
+    /// The instant DATE and TIME fields report.
+    pub(crate) fn clock(&self) -> (crate::field::context::Date, crate::field::context::Time) {
+        (
+            self.state.field_ctx.date.expect("set by `at`"),
+            self.state.field_ctx.time.expect("set by `at`"),
+        )
+    }
 
-    // Phase 2: render headers/footers with correct NUMPAGES (total page count).
-    let total_pages = all_pages.len();
-    for info in &section_hf {
-        state.page_config = info.config.clone();
-        render_headers_footers(
-            &mut all_pages[info.page_range.clone()],
-            &info.config,
-            &HeaderFooterBlocks {
-                headers: info.headers,
-                footers: info.footers,
-                title_pg: info.title_pg,
-                even_and_odd,
-            },
-            &ctx,
-            &mut state,
-            dlh,
-            &PageRange {
-                page_base: info.page_range.start,
-                logical_page_base: info.logical_page_base,
-                total_pages,
-            },
+    /// §17.11.2: the document's endnotes, built once after every section.
+    pub(crate) fn endnotes(&mut self) -> Vec<DocumentEndnote> {
+        build_document_endnotes(self.ctx, &mut self.state)
+    }
+
+    /// Phase 2 for one section's pages (`page_start` is the first one's index
+    /// in the document): headers and footers, with NUMPAGES = `total_pages`.
+    pub(crate) fn headers_footers(
+        &mut self,
+        pages: &mut [LayoutedPage],
+        section: &crate::render::resolve::sections::ResolvedSection,
+        hf: &SectionHf,
+        page_start: usize,
+        total_pages: usize,
+    ) {
+        let state = &mut self.state;
+        render_section_headers_footers(
+            self.ctx,
+            state,
+            self.dlh,
+            self.even_and_odd,
+            pages,
+            section,
+            hf,
+            page_start,
+            total_pages,
         );
     }
 
-    // Render endnotes on a new page at the end of the document.
-    if !all_endnotes.is_empty() {
+    /// [`Self::headers_footers`] against another state: the one phase 2 would
+    /// have, when phase 1 of later sections has not run yet (`render::stream`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn headers_footers_with(
+        &self,
+        state: &mut BuildState,
+        pages: &mut [LayoutedPage],
+        section: &crate::render::resolve::sections::ResolvedSection,
+        hf: &SectionHf,
+        page_start: usize,
+        total_pages: usize,
+    ) {
+        render_section_headers_footers(
+            self.ctx,
+            state,
+            self.dlh,
+            self.even_and_odd,
+            pages,
+            section,
+            hf,
+            page_start,
+            total_pages,
+        );
+    }
+
+    /// The page the endnotes go on, after the last section; `None` without endnotes.
+    pub(crate) fn endnote_page(&self, all_endnotes: &[DocumentEndnote]) -> Option<LayoutedPage> {
+        if all_endnotes.is_empty() {
+            return None;
+        }
         let measure_fn = |text: &str,
                           font: &layout::fragment::FontProps|
          -> (dimension::Pt, layout::fragment::TextMetrics) {
-            measurer.measure(text, font)
+            self.ctx.measurer.measure(text, font)
         };
-        let mut endnote_page = LayoutedPage::new(last_config.page_size);
-        let content_width = last_config.content_width();
+        let mut endnote_page = LayoutedPage::new(self.last_config.page_size);
+        let content_width = self.last_config.content_width();
         let constraints =
             layout::BoxConstraints::tight_width(content_width, dimension::Pt::INFINITY);
-        let mut cursor_y = last_config.margins.top;
+        let mut cursor_y = self.last_config.margins.top;
 
         // Separator line.
         let sep_width = content_width * 0.33;
-        let sep_x = last_config.margins.left + separator_indent;
+        let sep_x = self.last_config.margins.left + self.separator_indent;
         endnote_page
             .commands
             .push(layout::draw_command::DrawCommand::Line {
@@ -685,38 +837,56 @@ pub fn layout_document(
             });
         cursor_y += dimension::Pt::new(4.0);
 
-        for (_, frags, style) in &all_endnotes {
+        for (_, frags, style) in all_endnotes {
             let para = layout::paragraph::layout_paragraph(
                 frags,
                 &constraints,
                 style,
-                dlh,
+                self.dlh,
                 Some(&measure_fn),
             );
             for mut cmd in para.commands {
                 cmd.shift_y(cursor_y);
-                cmd.shift_x(last_config.margins.left);
+                cmd.shift_x(self.last_config.margins.left);
                 endnote_page.commands.push(cmd);
             }
             cursor_y += para.size.height;
         }
-        all_pages.push(endnote_page);
+        Some(endnote_page)
     }
+}
 
-    if all_pages.is_empty() {
-        all_pages.push(LayoutedPage::new(PageConfig::default().page_size));
-    }
-
-    // Last, over the finished page: fuse abutting same-colour fills so no
-    // rasterizer can leave a seam where two of them meet. Here rather than at
-    // any of the places that emit a rect, because the pairs come from several
-    // of them — table cell shading, paragraph shading, borders — and the rule
-    // is a property of the command stream, not of any one producer.
-    for page in &mut all_pages {
-        layout::draw_command::coalesce_abutting_rects(&mut page.commands);
-    }
-
-    all_pages
+#[allow(clippy::too_many_arguments)]
+fn render_section_headers_footers(
+    ctx: &BuildContext,
+    state: &mut BuildState,
+    dlh: dimension::Pt,
+    even_and_odd: bool,
+    pages: &mut [LayoutedPage],
+    section: &crate::render::resolve::sections::ResolvedSection,
+    hf: &SectionHf,
+    page_start: usize,
+    total_pages: usize,
+) {
+    state.page_config = hf.config.clone();
+    render_headers_footers(
+        pages,
+        &hf.config,
+        &HeaderFooterBlocks {
+            headers: &section.headers,
+            footers: &section.footers,
+            title_pg: hf.title_pg,
+            even_and_odd,
+        },
+        ctx,
+        state,
+        dlh,
+        &PageRange {
+            page_base: page_start,
+            logical_page_base: hf.logical_page_base,
+            total_pages,
+        },
+    );
 }
 
 /// Measure each populated header/footer slot independently so pagination can

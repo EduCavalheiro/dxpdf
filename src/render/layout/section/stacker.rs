@@ -438,7 +438,7 @@ mod tests {
     fn image(height: f32, wrap: WrapMode, y: FloatingImageY) -> FloatingImage {
         FloatingImage {
             image_data: MediaEntry {
-                data: std::sync::Arc::from(&b""[..]),
+                data: crate::model::MediaBytes::from_bytes(&b""[..]),
                 format: ImageFormat::Png,
             },
             size: PtSize::new(Pt::new(50.0), Pt::new(height)),

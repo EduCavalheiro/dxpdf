@@ -41,41 +41,67 @@ pub fn resolve_sections(
     header_parts: &HashMap<RelId, Vec<Block>>,
     footer_parts: &HashMap<RelId, Vec<Block>>,
 ) -> Vec<ResolvedSection> {
-    let mut sections = Vec::new();
-    let mut current_blocks = Vec::new();
-    let mut prev_headers: HeaderFooterSet<Vec<Block>> = HeaderFooterSet::default();
-    let mut prev_footers: HeaderFooterSet<Vec<Block>> = HeaderFooterSet::default();
+    let mut splitter = SectionSplitter::default();
+    let mut sections: Vec<ResolvedSection> = body
+        .into_iter()
+        .filter_map(|block| splitter.push(block, header_parts, footer_parts))
+        .collect();
+    sections.push(splitter.finish(final_section, header_parts, footer_parts));
+    sections
+}
 
-    for block in body {
+/// [`resolve_sections`] a block at a time: a section comes out once its
+/// break (`Block::SectionBreak`, which ends it) has gone in.
+#[derive(Default)]
+pub struct SectionSplitter {
+    current_blocks: Vec<Block>,
+    prev_headers: HeaderFooterSet<Vec<Block>>,
+    prev_footers: HeaderFooterSet<Vec<Block>>,
+}
+
+impl SectionSplitter {
+    pub fn push(
+        &mut self,
+        block: Block,
+        header_parts: &HashMap<RelId, Vec<Block>>,
+        footer_parts: &HashMap<RelId, Vec<Block>>,
+    ) -> Option<ResolvedSection> {
         match block {
             Block::SectionBreak(props) => {
-                let headers = resolve_set(&props.header_refs, header_parts, &prev_headers);
-                let footers = resolve_set(&props.footer_refs, footer_parts, &prev_footers);
-                prev_headers = headers.clone();
-                prev_footers = footers.clone();
-                sections.push(ResolvedSection {
-                    blocks: std::mem::take(&mut current_blocks),
+                let headers = resolve_set(&props.header_refs, header_parts, &self.prev_headers);
+                let footers = resolve_set(&props.footer_refs, footer_parts, &self.prev_footers);
+                self.prev_headers = headers.clone();
+                self.prev_footers = footers.clone();
+                Some(ResolvedSection {
+                    blocks: std::mem::take(&mut self.current_blocks),
                     headers,
                     footers,
                     properties: *props,
-                });
+                })
             }
             other => {
-                current_blocks.push(other);
+                self.current_blocks.push(other);
+                None
             }
         }
     }
 
-    let headers = resolve_set(&final_section.header_refs, header_parts, &prev_headers);
-    let footers = resolve_set(&final_section.footer_refs, footer_parts, &prev_footers);
-    sections.push(ResolvedSection {
-        blocks: current_blocks,
-        headers,
-        footers,
-        properties: final_section,
-    });
-
-    sections
+    /// The trailing section, which `final_section` (the body's last `w:sectPr`) describes.
+    pub fn finish(
+        self,
+        final_section: SectionProperties,
+        header_parts: &HashMap<RelId, Vec<Block>>,
+        footer_parts: &HashMap<RelId, Vec<Block>>,
+    ) -> ResolvedSection {
+        let headers = resolve_set(&final_section.header_refs, header_parts, &self.prev_headers);
+        let footers = resolve_set(&final_section.footer_refs, footer_parts, &self.prev_footers);
+        ResolvedSection {
+            blocks: self.current_blocks,
+            headers,
+            footers,
+            properties: final_section,
+        }
+    }
 }
 
 /// Resolve all three slots of a section's header (or footer) refs:

@@ -32,6 +32,32 @@ pub fn convert_with_options(docx_bytes: &[u8], options: &RenderOptions) -> Resul
     Ok(pdf_bytes)
 }
 
+/// [`convert_with_options`] writing the PDF to `out` as it is painted, so it
+/// is never held whole. The bytes are the same.
+pub fn convert_to_writer(
+    docx_bytes: &[u8],
+    options: &RenderOptions,
+    out: &mut impl std::io::Write,
+) -> Result<(), Error> {
+    let document = crate::docx::parse(docx_bytes)?;
+    crate::render::render_to(document, options, out)?;
+    Ok(())
+}
+
+/// Convert an opened package to PDF a section at a time, writing to `out`:
+/// memory follows the largest section instead of the document (see
+/// [`render::stream`]). Lays the document out twice, so it is slower than
+/// [`convert_to_writer`] and meant for documents too large for it. The bytes
+/// are the same.
+pub fn convert_streamed_to(
+    package: docx::zip::PackageContents,
+    options: &RenderOptions,
+    out: &mut impl std::io::Write,
+) -> Result<(), Error> {
+    let frame = crate::docx::parse::parse_frame(package)?;
+    crate::render::stream::render_to(frame.document, &frame.body, options, out)
+}
+
 // --- Python bindings (enabled with `python` feature) ---
 
 #[cfg(feature = "python")]

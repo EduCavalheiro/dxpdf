@@ -1151,7 +1151,7 @@ mod tests {
         resolved.media.insert(
             RelId::new("rId9"),
             crate::render::resolve::images::MediaEntry {
-                data: std::sync::Arc::from(&b"\x89PNG"[..]),
+                data: crate::model::MediaBytes::from_bytes(&b"\x89PNG"[..]),
                 format: crate::model::ImageFormat::Png,
             },
         );

@@ -29,3 +29,8 @@ pub mod zip;
 pub fn parse(data: &[u8]) -> error::Result<model::Document> {
     parse::parse(data)
 }
+
+/// Parse an already opened package; see [`zip::PackageContents::with_media`].
+pub fn parse_package(package: zip::PackageContents) -> error::Result<model::Document> {
+    parse::parse_package(package)
+}

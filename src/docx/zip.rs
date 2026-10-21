@@ -4,11 +4,15 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use crate::docx::error::{ParseError, Result};
+use crate::model::MediaBytes;
 
 /// The contents of a DOCX package, extracted from the ZIP archive.
 pub struct PackageContents {
     /// All files in the ZIP, keyed by normalized path (no leading slash).
     pub parts: HashMap<String, Vec<u8>>,
+    /// Media parts the caller provides as handles instead of bytes (see
+    /// [`with_media`](Self::with_media)), keyed by normalized path.
+    media: HashMap<String, MediaBytes>,
 }
 
 impl PackageContents {
@@ -26,7 +30,10 @@ impl PackageContents {
             parts.insert(name, buf);
         }
 
-        Ok(Self { parts })
+        Ok(Self {
+            parts,
+            media: HashMap::new(),
+        })
     }
 
     /// Get the bytes for a part, case-insensitively.
@@ -39,6 +46,30 @@ impl PackageContents {
     pub fn require_part(&self, path: &str) -> Result<&[u8]> {
         self.get_part(path)
             .ok_or_else(|| ParseError::MissingPart(path.to_string()))
+    }
+
+    /// Adds media parts as handles: a picture the document references at
+    /// one of these paths is read through its handle when it is painted,
+    /// instead of being held in memory from parse on. A path here takes
+    /// precedence over a part of the same name in the ZIP.
+    pub fn with_media(mut self, media: impl IntoIterator<Item = (String, MediaBytes)>) -> Self {
+        self.media.extend(
+            media
+                .into_iter()
+                .map(|(path, bytes)| (normalize_path(&path), bytes)),
+        );
+        self
+    }
+
+    /// The bytes of a media part: a fresh in-memory copy of the ZIP part, or,
+    /// for one the caller provided as a handle, a fresh handle to it. Fresh
+    /// either way: every reader of a part gets its own identity, so the
+    /// painter treats two parts referencing one picture alike in both cases.
+    pub fn media(&self, path: &str) -> Option<MediaBytes> {
+        match self.media.get(&normalize_path(path)) {
+            Some(bytes) => Some(bytes.fresh()),
+            None => self.get_part(path).map(MediaBytes::from_bytes),
+        }
     }
 
     /// Remove and return the owned bytes for a part. Avoids cloning.

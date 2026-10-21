@@ -1,7 +1,7 @@
 //! Top-level Document struct.
 
+use super::media::MediaBytes;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::content::Block;
 use super::drawing::ImageFormat;
@@ -33,14 +33,13 @@ pub struct Document {
     /// Embedded media (images) — raw bytes and detected format, keyed by
     /// relationship ID.
     ///
-    /// The bytes are shared rather than owned so that the resolve layer, which
-    /// consumes this document, hands the painter a *handle* instead of copying
-    /// every image a second time — on an image-heavy document that copy is the
-    /// single largest allocation in the pipeline. `Arc` rather than `Rc` keeps
-    /// `Document` `Send`, so a caller may still parse on one thread and render
-    /// on another; the refcount is touched once per image placement, which is
-    /// nowhere near hot enough for the atomic to matter.
-    pub media: HashMap<RelId, (Arc<[u8]>, ImageFormat)>,
+    /// The bytes are a shared handle ([`MediaBytes`]) rather than owned, so
+    /// that the resolve layer, which consumes this document, hands the painter
+    /// a *handle* instead of copying every image a second time; a package
+    /// built with [`PackageContents::with_media`](crate::docx::zip::PackageContents::with_media)
+    /// does not hold them in memory at all. The handle is `Send + Sync`, so
+    /// `Document` stays `Send`.
+    pub media: HashMap<RelId, (MediaBytes, ImageFormat)>,
     /// §17.8.3: embedded fonts — de-obfuscated font data.
     pub embedded_fonts: Vec<EmbeddedFont>,
 }

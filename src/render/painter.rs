@@ -44,8 +44,73 @@ type CropKey = Option<(i32, i32, i32, i32)>;
 /// of the same media get distinct entries when they draw at different sizes or
 /// under different `srcRect` crops — each caches its own correctly-scaled,
 /// pre-cropped bitmap, so neither reuses the other's resolution or crop.
-type ImageCacheKey = (*const [u8], i32, i32, CropKey);
+pub(crate) type ImageCacheKey = (*const (), i32, i32, CropKey);
 type ImageCache = HashMap<ImageCacheKey, skia_safe::Image>;
+
+/// Where a placement draws, its crop, and the [`ImageCache`] key it draws
+/// under: (media identity, downsample target for the display size, crop).
+/// The crop is baked into the cached bitmap, so two placements that differ
+/// only in size or in `srcRect` each cache their own bitmap.
+///
+/// §20.1.10.48: the srcRect is resolved against the image bounds. A region
+/// reaching outside the image (negative insets) pads the frame — it becomes
+/// an in-image crop plus a shrunken `dst`, and the padding band of `dst` is
+/// left undrawn. No srcRect → whole image to the whole dst; a region wholly
+/// outside the image → nothing to draw (`None`).
+fn image_placement(
+    rect: crate::render::geometry::PtRect,
+    src_rect: Option<&crate::render::geometry::PtRect>,
+    image_data: &MediaEntry,
+    image_dpi: f32,
+) -> Option<(
+    crate::render::geometry::PtRect,
+    Option<crate::render::geometry::PtRect>,
+    ImageCacheKey,
+)> {
+    let (draw_rect, crop) = match src_rect {
+        None => (rect, None),
+        Some(sr) => resolve_src_padding(rect, sr).map(|(d, c)| (d, Some(c)))?,
+    };
+    let (target_w, target_h) = downsample_target(draw_rect, image_dpi);
+    let key = (
+        image_data.data.id(),
+        target_w,
+        target_h,
+        crop.as_ref().map(quantize_crop),
+    );
+    Some((draw_rect, crop, key))
+}
+
+/// The index of the last page each cached bitmap is drawn on: once that page
+/// is painted the bitmap is dropped, as nothing later asks for it again. The
+/// PDF is the same either way; only how long a decoded picture lives changes
+/// (a few MB each, held to the end of the render otherwise).
+fn image_last_uses(pages: &[LayoutedPage], image_dpi: f32) -> HashMap<ImageCacheKey, usize> {
+    let mut last = HashMap::new();
+    for (index, page) in pages.iter().enumerate() {
+        for key in image_keys(page, image_dpi) {
+            last.insert(key, index);
+        }
+    }
+    last
+}
+
+/// The [`ImageCache`] keys `page` draws under, in drawing order.
+pub(crate) fn image_keys(
+    page: &LayoutedPage,
+    image_dpi: f32,
+) -> impl Iterator<Item = ImageCacheKey> + '_ {
+    page.commands.iter().filter_map(move |cmd| match cmd {
+        DrawCommand::Image {
+            rect,
+            image_data,
+            src_rect,
+        } => {
+            image_placement(*rect, src_rect.as_ref(), image_data, image_dpi).map(|(_, _, key)| key)
+        }
+        _ => None,
+    })
+}
 
 /// Downsample target dimensions (in pixels) for a display rect at `image_dpi`.
 /// Shared by the image cache key and the downsample passes so both agree on the
@@ -87,7 +152,9 @@ fn quantize_crop(crop: &crate::render::geometry::PtRect) -> (i32, i32, i32, i32)
 /// The title comes from `set_alt`, and must: this Skia has no `fTitle` field on
 /// the public node, so a node without an alt contributes **no outline entry at
 /// all** rather than an untitled one.
-fn build_outline_tree(pages: &[LayoutedPage]) -> Option<pdf::StructureElementNode<'static>> {
+pub(crate) fn build_outline_tree(
+    pages: &[LayoutedPage],
+) -> Option<pdf::StructureElementNode<'static>> {
     let mut root = pdf::StructureElementNode::new("Document");
     let mut any = false;
 
@@ -144,11 +211,54 @@ pub fn render_to_pdf(
     options: &RenderOptions,
 ) -> Result<Vec<u8>, RenderError> {
     let mut pdf_bytes: Vec<u8> = Vec::new();
+    let last_uses = image_last_uses(pages, options.image_dpi());
+    paint_pages(
+        build_outline_tree(pages),
+        last_uses,
+        pages.iter(),
+        registry,
+        options,
+        &mut pdf_bytes,
+    );
+    Ok(pdf_bytes)
+}
+
+/// [`render_to_pdf`] that consumes the pages and writes the PDF to `out` as
+/// it goes: each page is dropped once painted, and Skia writes its content
+/// to `out` when the page ends, so neither the laid-out document nor the
+/// PDF is held whole. The output is byte for byte the one `render_to_pdf`
+/// produces.
+pub fn render_pages_to(
+    pages: Vec<LayoutedPage>,
+    registry: &FontRegistry,
+    options: &RenderOptions,
+    out: &mut impl std::io::Write,
+) -> Result<(), RenderError> {
+    let last_uses = image_last_uses(&pages, options.image_dpi());
+    let structure_tree = build_outline_tree(&pages);
+    paint_pages(
+        structure_tree,
+        last_uses,
+        pages.into_iter(),
+        registry,
+        options,
+        out,
+    );
+    Ok(())
+}
+
+pub(crate) fn paint_pages<P: std::borrow::Borrow<LayoutedPage>>(
+    structure_tree: Option<pdf::StructureElementNode<'static>>,
+    last_uses: HashMap<ImageCacheKey, usize>,
+    pages: impl Iterator<Item = P>,
+    registry: &FontRegistry,
+    options: &RenderOptions,
+    out: &mut impl std::io::Write,
+) {
     // §17.3.1.19: the outline is document-level, so its structure tree has to
     // exist before the first page — `pdf::new_document` takes it by reference
     // and holds it for the document's lifetime. Layout has already finished, so
     // the headings are all knowable here.
-    let structure_tree = build_outline_tree(pages);
     let pdf_metadata = pdf::Metadata {
         encoding_quality: Some(85),
         // A document with no headings gets neither, so it keeps its current
@@ -168,19 +278,22 @@ pub fn render_to_pdf(
         structure_element_tree_root: structure_tree,
         ..Default::default()
     };
-    let mut doc = pdf::new_document(&mut pdf_bytes, Some(&pdf_metadata));
+    let mut doc = pdf::new_document(out, Some(&pdf_metadata));
     let mut state = PaintState::new();
-    for page in pages {
+    for (index, page) in pages.enumerate() {
+        let page = page.borrow();
         let mut on_page = doc.begin_page(to_size(page.page_size), None);
         {
             let canvas = on_page.canvas();
             render_page(canvas, page, registry, &mut state, options);
         }
         doc = on_page.end_page();
+        state
+            .image_cache
+            .retain(|key, _| last_uses.get(key).is_some_and(|&last| last > index));
     }
 
     doc.close();
-    Ok(pdf_bytes)
 }
 
 /// Mutable per-render caches, shared across every page and bundled into one
@@ -456,23 +569,10 @@ fn render_page(
                 // and the padding band of `dst` is left undrawn. No srcRect →
                 // whole image to the whole dst; a region wholly outside the
                 // image → nothing to draw.
-                let resolved = match src_rect {
-                    None => Some((*rect, None)),
-                    Some(sr) => resolve_src_padding(*rect, sr).map(|(d, c)| (d, Some(c))),
-                };
-                if let Some((draw_rect, crop)) = resolved {
+                if let Some((draw_rect, crop, key)) =
+                    image_placement(*rect, src_rect.as_ref(), image_data, image_dpi)
+                {
                     let dst = to_rect(draw_rect);
-                    // Key on (media identity, downsample target for the display
-                    // size, crop). The crop is baked into the cached bitmap
-                    // below, so two placements that differ only in size or in
-                    // `srcRect` each cache their own bitmap.
-                    let (target_w, target_h) = downsample_target(draw_rect, image_dpi);
-                    let key = (
-                        std::sync::Arc::as_ptr(&image_data.data),
-                        target_w,
-                        target_h,
-                        crop.as_ref().map(quantize_crop),
-                    );
                     if let Some(image) = image_cache.get(&key) {
                         // The cached bitmap already has any crop baked in → the
                         // whole bitmap maps to `dst`.
@@ -511,12 +611,13 @@ fn render_page(
                             }
                         }
                     } else {
-                        let magic = &image_data.data[..image_data.data.len().min(4)];
+                        let bytes = image_data.data.bytes().unwrap_or_default();
+                        let magic = &bytes[..bytes.len().min(4)];
                         log::warn!(
                             "[paint] unsupported image format {:?} — could not decode {} bytes \
                              (magic: {:02x?}); image will be blank",
                             image_data.format,
-                            image_data.data.len(),
+                            bytes.len(),
                             magic,
                         );
                     }
@@ -873,10 +974,11 @@ fn paint_effect(
 /// Returns `None` if the format is unsupported or the data is malformed.
 fn decode_image(entry: &MediaEntry) -> Option<skia_safe::Image> {
     use crate::model::ImageFormat;
+    let bytes = entry.data.bytes()?;
     match entry.format {
-        ImageFormat::Emf => crate::render::emf::decode_emf_bitmap(&entry.data),
+        ImageFormat::Emf => crate::render::emf::decode_emf_bitmap(&bytes),
         // All other formats are handled by Skia's built-in decoder.
-        _ => skia_safe::Image::from_encoded(Data::new_copy(&entry.data)),
+        _ => skia_safe::Image::from_encoded(Data::new_copy(&bytes)),
     }
 }
 
@@ -1381,7 +1483,7 @@ mod tests {
         use crate::render::resolve::images::MediaEntry;
 
         let media = MediaEntry {
-            data: std::sync::Arc::from(textured_png(1200).into_boxed_slice()),
+            data: crate::model::MediaBytes::from_bytes(textured_png(1200)),
             format: ImageFormat::Png,
         };
         let page = || LayoutedPage {
@@ -1416,7 +1518,7 @@ mod tests {
         use crate::render::resolve::images::MediaEntry;
 
         let media = MediaEntry {
-            data: std::sync::Arc::from(textured_png(1200).into_boxed_slice()),
+            data: crate::model::MediaBytes::from_bytes(textured_png(1200)),
             format: ImageFormat::Png,
         };
         let page = || LayoutedPage {

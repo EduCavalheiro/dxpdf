@@ -65,6 +65,13 @@ impl CodepointUsage {
         self.per_typeface.get(&id)
     }
 
+    /// Adds `other`'s codepoints: what [`collect`] over both page sets returns.
+    pub fn merge(&mut self, other: CodepointUsage) {
+        for (id, codepoints) in other.per_typeface {
+            self.per_typeface.entry(id).or_default().extend(codepoints);
+        }
+    }
+
     fn insert(&mut self, id: TypefaceId, chars: impl IntoIterator<Item = char>) {
         let entry = self.per_typeface.entry(id).or_default();
         for c in chars {

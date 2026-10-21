@@ -583,7 +583,10 @@ fn media_bytes_are_nonempty() {
     for name in ALL_FILES {
         let doc = load(name);
         for (rel_id, (data, _fmt)) in &doc.media {
-            assert!(!data.is_empty(), "{name}: media {rel_id:?} has empty bytes");
+            assert!(
+                data.bytes().is_some_and(|b| !b.is_empty()),
+                "{name}: media {rel_id:?} has empty bytes"
+            );
         }
     }
 }
