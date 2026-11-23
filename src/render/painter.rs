@@ -612,7 +612,10 @@ fn render_page(
                         // The cached bitmap already has any crop baked in → the
                         // whole bitmap maps to `dst`.
                         canvas.draw_image_rect(image, None, dst, &default_paint);
-                    } else if let Some(decoded) = decode_image(image_data) {
+                    } else if let Some(decoded) = decode_image(
+                        image_data,
+                        decode_floor(draw_rect, crop.as_ref(), image_dpi),
+                    ) {
                         match &crop {
                             // Bake the visible sub-region into a right-sized
                             // bitmap so the PDF never carries the cropped-away
@@ -1007,13 +1010,69 @@ fn paint_effect(
 /// Decode a `MediaEntry` to a Skia image, dispatching on format.
 ///
 /// Returns `None` if the format is unsupported or the data is malformed.
-fn decode_image(entry: &MediaEntry) -> Option<skia_safe::Image> {
+///
+/// `floor` is the smallest size, in pixels of the whole oriented image, the
+/// placement needs ([`decode_floor`]). A codec that can decode straight to a
+/// smaller size (JPEG, in eighths) is asked for the smallest one still
+/// covering it, so a 108 MP photo drawn a few centimetres wide never exists
+/// at full resolution in memory.
+fn decode_image(entry: &MediaEntry, floor: (i32, i32)) -> Option<skia_safe::Image> {
     use crate::model::ImageFormat;
     entry.data.with_bytes(|bytes| match entry.format {
         ImageFormat::Emf => crate::render::emf::decode_emf_bitmap(bytes),
         // All other formats are handled by Skia's built-in decoder.
-        _ => skia_safe::Image::from_encoded(Data::new_copy(bytes)),
+        _ => {
+            let data = Data::new_copy(bytes);
+            decode_reduced(&data, floor).or_else(|| skia_safe::Image::from_encoded(data))
+        }
     })?
+}
+
+/// The pixel size the whole image must keep for a placement to reach
+/// `image_dpi`: the downsample target, scaled up by the crop when only a
+/// fraction of the image is visible.
+fn decode_floor(
+    draw_rect: crate::render::geometry::PtRect,
+    crop: Option<&crate::render::geometry::PtRect>,
+    image_dpi: f32,
+) -> (i32, i32) {
+    let (target_w, target_h) = downsample_target(draw_rect, image_dpi);
+    match crop {
+        None => (target_w, target_h),
+        Some(crop) => (
+            (target_w as f32 / crop.size.width.raw()).ceil() as i32,
+            (target_h as f32 / crop.size.height.raw()).ceil() as i32,
+        ),
+    }
+}
+
+/// Decode at the smallest size the codec offers that still covers `floor`,
+/// oriented as [`skia_safe::Image::from_encoded`] would. `None` when the
+/// codec has no smaller size to offer or the decode fails; the caller then
+/// decodes at full size.
+fn decode_reduced(data: &Data, floor: (i32, i32)) -> Option<skia_safe::Image> {
+    use skia_safe::codec::Codec;
+
+    let mut codec = Codec::from_data(data.clone())?;
+    let sideways = codec.origin().swaps_width_height();
+    let (floor_w, floor_h) = if sideways { (floor.1, floor.0) } else { floor };
+    if floor_w <= 0 || floor_h <= 0 {
+        return None;
+    }
+    let full = codec.dimensions();
+    let reduced = (1..8)
+        .map(|eighths| codec.get_scaled_dimensions(eighths as f32 / 8.0))
+        .find(|size| size.width >= floor_w && size.height >= floor_h)
+        .filter(|size| size.width < full.width && size.height < full.height)?;
+    // `get_image` applies the Exif orientation and takes the oriented size.
+    let oriented = if sideways {
+        skia_safe::ISize::new(reduced.height, reduced.width)
+    } else {
+        reduced
+    };
+    codec
+        .get_image(codec.info().with_dimensions(oriented), None)
+        .ok()
 }
 
 /// Downsample an image if its native pixel dimensions significantly exceed
@@ -1617,6 +1676,157 @@ mod tests {
         assert_eq!(quantize_crop(&a), quantize_crop(&a));
         // 50% == 50000 thousandth-percent.
         assert_eq!(quantize_crop(&a), (25000, 25000, 50000, 50000));
+    }
+
+    /// A JPEG whose four quadrants each have their own colour, so a wrong
+    /// orientation shows as a wrong colour at a known position.
+    fn quadrant_jpeg(w: i32, h: i32) -> Vec<u8> {
+        use skia_safe::{AlphaType, ColorType, EncodedImageFormat, ImageInfo};
+        let info = ImageInfo::new((w, h), ColorType::RGBA8888, AlphaType::Opaque, None);
+        let mut surface = skia_safe::surfaces::raster(&info, None, None).expect("raster surface");
+        let (half_w, half_h) = (w as f32 / 2.0, h as f32 / 2.0);
+        let quadrants = [
+            (0.0, 0.0, Color4f::new(1.0, 0.0, 0.0, 1.0)),
+            (half_w, 0.0, Color4f::new(0.0, 1.0, 0.0, 1.0)),
+            (0.0, half_h, Color4f::new(0.0, 0.0, 1.0, 1.0)),
+            (half_w, half_h, Color4f::new(1.0, 1.0, 1.0, 1.0)),
+        ];
+        for (x, y, color) in quadrants {
+            let mut paint = Paint::default();
+            paint.set_color4f(color, None);
+            surface
+                .canvas()
+                .draw_rect(skia_safe::Rect::from_xywh(x, y, half_w, half_h), &paint);
+        }
+        surface
+            .image_snapshot()
+            .encode(None, EncodedImageFormat::JPEG, 90)
+            .expect("encode jpeg")
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// `jpeg` with an Exif APP1 segment declaring `orientation` (TIFF tag 0x0112).
+    fn with_exif_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
+        let tiff = [
+            b"MM\0*\0\0\0\x08".as_slice(),
+            &[0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, orientation, 0, 0],
+            &[0, 0, 0, 0],
+        ]
+        .concat();
+        let length = (2 + 6 + tiff.len()) as u16;
+        [
+            &jpeg[..2],
+            &[0xFF, 0xE1],
+            &length.to_be_bytes(),
+            b"Exif\0\0",
+            &tiff,
+            &jpeg[2..],
+        ]
+        .concat()
+    }
+
+    fn jpeg_media(bytes: Vec<u8>) -> crate::render::resolve::images::MediaEntry {
+        crate::render::resolve::images::MediaEntry {
+            data: crate::model::MediaBytes::from_bytes(bytes),
+            format: crate::model::ImageFormat::Jpeg,
+        }
+    }
+
+    /// The RGB at a position given as a fraction of the image's size.
+    fn rgb_at(image: &skia_safe::Image, fx: f32, fy: f32) -> [u8; 3] {
+        use skia_safe::{image::CachingHint, AlphaType, ColorType, ImageInfo};
+        let info = ImageInfo::new((1, 1), ColorType::RGBA8888, AlphaType::Unpremul, None);
+        let mut pixel = [0u8; 4];
+        let at = (
+            (image.width() as f32 * fx) as i32,
+            (image.height() as f32 * fy) as i32,
+        );
+        assert!(image.read_pixels(&info, &mut pixel, 4, at, CachingHint::Disallow));
+        [pixel[0], pixel[1], pixel[2]]
+    }
+
+    fn assert_same_quadrants(reduced: &skia_safe::Image, full: &skia_safe::Image) {
+        for (fx, fy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+            let (a, b) = (rgb_at(reduced, fx, fy), rgb_at(full, fx, fy));
+            let close = a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 8);
+            assert!(close, "quadrant ({fx}, {fy}): reduced {a:?}, full {b:?}");
+        }
+    }
+
+    #[test]
+    fn decode_image_decodes_a_jpeg_at_the_smallest_size_covering_the_floor() {
+        // 4000×3000 drawn at 300×225: an eighth (500×375) covers it, so the
+        // 48 MB full-size bitmap is never decoded.
+        let media = jpeg_media(quadrant_jpeg(4000, 3000));
+        let reduced = decode_image(&media, (300, 225)).expect("decode");
+        assert_eq!((reduced.width(), reduced.height()), (500, 375));
+
+        // A floor between two steps takes the larger one, never the smaller.
+        let reduced = decode_image(&media, (501, 300)).expect("decode");
+        assert_eq!((reduced.width(), reduced.height()), (1000, 750));
+
+        let full = decode_image(&media, (4000, 3000)).expect("decode");
+        assert_same_quadrants(&reduced, &full);
+    }
+
+    #[test]
+    fn decode_image_keeps_full_size_when_no_smaller_size_covers_the_floor() {
+        let media = jpeg_media(quadrant_jpeg(400, 300));
+        for floor in [(400, 300), (380, 290), (4000, 3000), (0, 0)] {
+            let decoded = decode_image(&media, floor).expect("decode");
+            assert_eq!((decoded.width(), decoded.height()), (400, 300), "{floor:?}");
+        }
+
+        // PNG has no reduced decode: the codec offers the full size only.
+        let png = crate::render::resolve::images::MediaEntry {
+            data: crate::model::MediaBytes::from_bytes(textured_png(1200)),
+            format: crate::model::ImageFormat::Png,
+        };
+        let decoded = decode_image(&png, (100, 100)).expect("decode");
+        assert_eq!((decoded.width(), decoded.height()), (1200, 1200));
+    }
+
+    #[test]
+    fn decode_image_orients_a_reduced_jpeg_like_the_full_size_decode() {
+        // Phone photos are stored sideways with an Exif orientation. Every
+        // orientation must come out of the reduced decode as it does out of
+        // Skia's own full-size one, at the size of the oriented image.
+        let jpeg = quadrant_jpeg(4000, 3000);
+        for orientation in 1..=8 {
+            let media = jpeg_media(with_exif_orientation(&jpeg, orientation));
+            let full = decode_image(&media, (i32::MAX, i32::MAX)).expect("decode");
+            let sideways = orientation >= 5;
+            let expected = if sideways { (3000, 4000) } else { (4000, 3000) };
+            assert_eq!((full.width(), full.height()), expected, "{orientation}");
+
+            let floor = if sideways { (225, 300) } else { (300, 225) };
+            let reduced = decode_image(&media, floor).expect("decode");
+            let expected = if sideways { (375, 500) } else { (500, 375) };
+            assert_eq!(
+                (reduced.width(), reduced.height()),
+                expected,
+                "{orientation}"
+            );
+            assert_same_quadrants(&reduced, &full);
+        }
+    }
+
+    #[test]
+    fn decode_floor_grows_with_the_crop() {
+        // 72pt at 300 DPI is 300px. Showing half the image in it needs the
+        // whole image at 600px for the visible half to still reach 300.
+        assert_eq!(decode_floor(rect(72.0, 72.0), None, 300.0), (300, 300));
+        let crop = crate::render::geometry::PtRect::from_xywh(
+            Pt::new(0.25),
+            Pt::new(0.0),
+            Pt::new(0.5),
+            Pt::new(1.0),
+        );
+        assert_eq!(
+            decode_floor(rect(72.0, 72.0), Some(&crop), 300.0),
+            (600, 300)
+        );
     }
 
     /// Opaque solid-color test image of the given pixel dimensions.
